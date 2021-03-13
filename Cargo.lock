@@ -43,12 +43,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "align-data"
-version = "0.1.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1926655ba000b19e21f0402be09a1d52d318c8a8a68622870bfb7af2a71315cd"
-
-[[package]]
 name = "alloc-no-stdlib"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -553,10 +547,16 @@ dependencies = [
 ]
 
 [[package]]
-name = "deno_core"
-version = "0.80.2"
+name = "deno_console"
+version = "0.1.0"
 dependencies = [
- "align-data",
+ "deno_core",
+]
+
+[[package]]
+name = "deno_core"
+version = "0.81.0"
+dependencies = [
  "anyhow",
  "futures",
  "indexmap",
@@ -574,7 +574,7 @@ dependencies = [
 
 [[package]]
 name = "deno_crypto"
-version = "0.14.1"
+version = "0.15.0"
 dependencies = [
  "deno_core",
  "rand 0.8.3",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "deno_fetch"
-version = "0.22.3"
+version = "0.23.0"
 dependencies = [
  "bytes",
  "deno_core",
@@ -632,11 +632,14 @@ name = "deno_runtime"
 version = "0.9.3"
 dependencies = [
  "atty",
+ "deno_console",
  "deno_core",
  "deno_crypto",
  "deno_fetch",
+ "deno_url",
  "deno_web",
  "deno_webgpu",
+ "deno_webidl",
  "deno_websocket",
  "dlopen",
  "encoding_rs",
@@ -669,17 +672,25 @@ dependencies = [
 ]
 
 [[package]]
-name = "deno_web"
-version = "0.30.3"
+name = "deno_url"
+version = "0.1.0"
 dependencies = [
  "deno_core",
- "futures",
+ "idna",
  "serde",
 ]
 
 [[package]]
+name = "deno_web"
+version = "0.31.0"
+dependencies = [
+ "deno_core",
+ "futures",
+]
+
+[[package]]
 name = "deno_webgpu"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "deno_core",
  "serde",
@@ -689,8 +700,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "deno_webidl"
+version = "0.1.0"
+dependencies = [
+ "deno_core",
+]
+
+[[package]]
 name = "deno_websocket"
-version = "0.5.3"
+version = "0.6.0"
 dependencies = [
  "deno_core",
  "http",
