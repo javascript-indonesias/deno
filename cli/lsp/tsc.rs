@@ -1202,7 +1202,7 @@ impl CompletionEntry {
         None
       };
 
-    let data = CompletionItemData {
+    let tsc = CompletionItemData {
       specifier: specifier.clone(),
       position,
       name: self.name.clone(),
@@ -1220,7 +1220,9 @@ impl CompletionEntry {
       filter_text,
       detail,
       tags,
-      data: Some(serde_json::to_value(data).unwrap()),
+      data: Some(json!({
+        "tsc": tsc,
+      })),
       ..Default::default()
     }
   }
@@ -1307,6 +1309,31 @@ impl SignatureHelpParameter {
       documentation: Some(lsp::Documentation::String(display_parts_to_string(
         &self.documentation,
       ))),
+    }
+  }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SelectionRange {
+  text_span: TextSpan,
+  #[serde(skip_serializing_if = "Option::is_none")]
+  parent: Option<Box<SelectionRange>>,
+}
+
+impl SelectionRange {
+  pub fn to_selection_range(
+    &self,
+    line_index: &LineIndex,
+  ) -> lsp::SelectionRange {
+    lsp::SelectionRange {
+      range: self.text_span.to_range(line_index),
+      parent: match &self.parent {
+        Some(parent_selection) => {
+          Some(Box::new(parent_selection.to_selection_range(line_index)))
+        }
+        None => None,
+      },
     }
   }
 }
@@ -1856,6 +1883,8 @@ pub enum RequestMethod {
   GetReferences((ModuleSpecifier, u32)),
   /// Get signature help items for a specific position.
   GetSignatureHelpItems((ModuleSpecifier, u32, SignatureHelpItemsOptions)),
+  /// Get a selection range for a specific position.
+  GetSmartSelectionRange((ModuleSpecifier, u32)),
   /// Get the diagnostic codes that support some form of code fix.
   GetSupportedCodeFixes,
 }
@@ -1977,6 +2006,14 @@ impl RequestMethod {
           "options": options,
         })
       }
+      RequestMethod::GetSmartSelectionRange((specifier, position)) => {
+        json!({
+          "id": id,
+          "method": "getSmartSelectionRange",
+          "specifier": specifier,
+          "position": position
+        })
+      }
       RequestMethod::GetSupportedCodeFixes => json!({
         "id": id,
         "method": "getSupportedCodeFixes",
@@ -2040,12 +2077,16 @@ mod tests {
       let specifier =
         resolve_url(specifier).expect("failed to create specifier");
       documents.open(specifier.clone(), *version, source);
-      if let Some((deps, _)) = analysis::analyze_dependencies(
-        &specifier,
-        source,
-        &MediaType::from(&specifier),
-        &None,
-      ) {
+      let media_type = MediaType::from(&specifier);
+      if let Ok(parsed_module) =
+        analysis::parse_module(&specifier, source, &media_type)
+      {
+        let (deps, _) = analysis::analyze_dependencies(
+          &specifier,
+          &media_type,
+          &parsed_module,
+          &None,
+        );
         documents.set_dependencies(&specifier, Some(deps)).unwrap();
       }
     }
