@@ -166,11 +166,7 @@ pub async fn get_asset(
       .request(state_snapshot, RequestMethod::GetAsset(specifier.clone()))
       .await?;
     let maybe_text: Option<String> = serde_json::from_value(res)?;
-    let maybe_asset = if let Some(text) = maybe_text {
-      Some(AssetDocument::new(text))
-    } else {
-      None
-    };
+    let maybe_asset = maybe_text.map(AssetDocument::new);
     Ok(maybe_asset)
   }
 }
@@ -183,7 +179,7 @@ fn display_parts_to_string(parts: &[SymbolDisplayPart]) -> String {
     .join("")
 }
 
-fn get_tag_body_text(tag: &JSDocTagInfo) -> Option<String> {
+fn get_tag_body_text(tag: &JsDocTagInfo) -> Option<String> {
   tag.text.as_ref().map(|text| match tag.name.as_str() {
     "example" => {
       let caption_regex =
@@ -209,7 +205,7 @@ fn get_tag_body_text(tag: &JSDocTagInfo) -> Option<String> {
   })
 }
 
-fn get_tag_documentation(tag: &JSDocTagInfo) -> String {
+fn get_tag_documentation(tag: &JsDocTagInfo) -> String {
   match tag.name.as_str() {
     "augments" | "extends" | "param" | "template" => {
       if let Some(text) = &tag.text {
@@ -439,7 +435,7 @@ pub struct SymbolDisplayPart {
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct JSDocTagInfo {
+pub struct JsDocTagInfo {
   name: String,
   text: Option<String>,
 }
@@ -452,7 +448,7 @@ pub struct QuickInfo {
   text_span: TextSpan,
   display_parts: Option<Vec<SymbolDisplayPart>>,
   documentation: Option<Vec<SymbolDisplayPart>>,
-  tags: Option<Vec<JSDocTagInfo>>,
+  tags: Option<Vec<JsDocTagInfo>>,
 }
 
 impl QuickInfo {
@@ -536,10 +532,11 @@ impl DocumentSpan {
     let origin_selection_range =
       if let Some(original_context_span) = &self.original_context_span {
         Some(original_context_span.to_range(line_index))
-      } else if let Some(original_text_span) = &self.original_text_span {
-        Some(original_text_span.to_range(line_index))
       } else {
-        None
+        self
+          .original_text_span
+          .as_ref()
+          .map(|original_text_span| original_text_span.to_range(line_index))
       };
     let link = lsp::LocationLink {
       origin_selection_range,
@@ -927,7 +924,7 @@ pub struct CompletionEntryDetails {
   kind_modifiers: String,
   display_parts: Vec<SymbolDisplayPart>,
   documentation: Option<Vec<SymbolDisplayPart>>,
-  tags: Option<Vec<JSDocTagInfo>>,
+  tags: Option<Vec<JsDocTagInfo>>,
   code_actions: Option<Vec<CodeAction>>,
   source: Option<Vec<SymbolDisplayPart>>,
 }
@@ -1261,7 +1258,7 @@ pub struct SignatureHelpItem {
   separator_display_parts: Vec<SymbolDisplayPart>,
   parameters: Vec<SignatureHelpParameter>,
   documentation: Vec<SymbolDisplayPart>,
-  tags: Vec<JSDocTagInfo>,
+  tags: Vec<JsDocTagInfo>,
 }
 
 impl SignatureHelpItem {
@@ -1328,12 +1325,9 @@ impl SelectionRange {
   ) -> lsp::SelectionRange {
     lsp::SelectionRange {
       range: self.text_span.to_range(line_index),
-      parent: match &self.parent {
-        Some(parent_selection) => {
-          Some(Box::new(parent_selection.to_selection_range(line_index)))
-        }
-        None => None,
-      },
+      parent: self.parent.as_ref().map(|parent_selection| {
+        Box::new(parent_selection.to_selection_range(line_index))
+      }),
     }
   }
 }
@@ -1345,7 +1339,6 @@ struct Response {
 }
 
 struct State<'a> {
-  asset: Option<String>,
   last_id: usize,
   response: Option<Response>,
   state_snapshot: StateSnapshot,
@@ -1355,7 +1348,6 @@ struct State<'a> {
 impl<'a> State<'a> {
   fn new(state_snapshot: StateSnapshot) -> Self {
     Self {
-      asset: None,
       last_id: 1,
       response: None,
       state_snapshot,
@@ -1673,18 +1665,6 @@ fn script_version(
   Ok(None)
 }
 
-#[derive(Debug, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SetAssetArgs {
-  text: Option<String>,
-}
-
-#[allow(clippy::unnecessary_wraps)]
-fn set_asset(state: &mut State, args: SetAssetArgs) -> Result<bool, AnyError> {
-  state.asset = args.text;
-  Ok(true)
-}
-
 /// Create and setup a JsRuntime based on a snapshot. It is expected that the
 /// supplied snapshot is an isolate that contains the TypeScript language
 /// server.
@@ -1708,7 +1688,6 @@ pub fn start(debug: bool) -> Result<JsRuntime, AnyError> {
   runtime.register_op("op_respond", op(respond));
   runtime.register_op("op_script_names", op(script_names));
   runtime.register_op("op_script_version", op(script_version));
-  runtime.register_op("op_set_asset", op(set_asset));
 
   let init_config = json!({ "debug": debug });
   let init_src = format!("globalThis.serverInit({});", init_config);
