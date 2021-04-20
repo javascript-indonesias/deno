@@ -6,6 +6,8 @@ use super::analysis::ResolvedDependencyErr;
 use super::config;
 use super::language_server;
 use super::language_server::StateSnapshot;
+use super::semantic_tokens::SemanticTokensBuilder;
+use super::semantic_tokens::TsTokenEncodingConsts;
 use super::text;
 use super::text::LineIndex;
 
@@ -39,7 +41,7 @@ use std::collections::HashSet;
 use std::thread;
 use std::{borrow::Cow, cmp};
 use std::{collections::HashMap, path::Path};
-use text_size::TextSize;
+use text_size::{TextRange, TextSize};
 use tokio::sync::mpsc;
 use tokio::sync::oneshot;
 
@@ -619,6 +621,90 @@ impl NavigationTree {
     }
   }
 
+  pub fn collect_document_symbols(
+    &self,
+    line_index: &LineIndex,
+    document_symbols: &mut Vec<lsp::DocumentSymbol>,
+  ) -> bool {
+    let mut should_include = self.should_include_entry();
+    if !should_include
+      && self.child_items.as_ref().map_or(true, |v| v.is_empty())
+    {
+      return false;
+    }
+
+    let children = self
+      .child_items
+      .as_ref()
+      .map_or(&[] as &[NavigationTree], |v| v.as_slice());
+    for span in self.spans.iter() {
+      let range = TextRange::at(span.start.into(), span.length.into());
+      let mut symbol_children = Vec::<lsp::DocumentSymbol>::new();
+      for child in children.iter() {
+        let should_traverse_child = child
+          .spans
+          .iter()
+          .map(|child_span| {
+            TextRange::at(child_span.start.into(), child_span.length.into())
+          })
+          .any(|child_range| range.intersect(child_range).is_some());
+        if should_traverse_child {
+          let included_child =
+            child.collect_document_symbols(line_index, &mut symbol_children);
+          should_include = should_include || included_child;
+        }
+      }
+
+      if should_include {
+        let mut selection_span = span;
+        if let Some(name_span) = self.name_span.as_ref() {
+          let name_range =
+            TextRange::at(name_span.start.into(), name_span.length.into());
+          if range.contains_range(name_range) {
+            selection_span = name_span;
+          }
+        }
+
+        let mut tags: Option<Vec<lsp::SymbolTag>> = None;
+        let kind_modifiers = parse_kind_modifier(&self.kind_modifiers);
+        if kind_modifiers.contains("deprecated") {
+          tags = Some(vec![lsp::SymbolTag::Deprecated]);
+        }
+
+        let children = if !symbol_children.is_empty() {
+          Some(symbol_children)
+        } else {
+          None
+        };
+
+        // The field `deprecated` is deprecated but DocumentSymbol does not have
+        // a default, therefore we have to supply the deprecated deprecated
+        // field. It is like a bad version of Inception.
+        #[allow(deprecated)]
+        document_symbols.push(lsp::DocumentSymbol {
+          name: self.text.clone(),
+          kind: self.kind.clone().into(),
+          range: span.to_range(line_index),
+          selection_range: selection_span.to_range(line_index),
+          tags,
+          children,
+          detail: None,
+          deprecated: None,
+        })
+      }
+    }
+
+    should_include
+  }
+
+  fn should_include_entry(&self) -> bool {
+    if let ScriptElementKind::Alias = self.kind {
+      return false;
+    }
+
+    !self.text.is_empty() && self.text != "<function>" && self.text != "<class>"
+  }
+
   pub fn walk<F>(&self, callback: &F)
   where
     F: Fn(&NavigationTree, Option<&NavigationTree>),
@@ -883,6 +969,56 @@ impl FileTextChanges {
       },
       edits,
     })
+  }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Classifications {
+  spans: Vec<u32>,
+}
+
+impl Classifications {
+  pub fn to_semantic_tokens(
+    &self,
+    line_index: &LineIndex,
+  ) -> lsp::SemanticTokens {
+    let token_count = self.spans.len() / 3;
+    let mut builder = SemanticTokensBuilder::new();
+    for i in 0..token_count {
+      let src_offset = 3 * i;
+      let offset = self.spans[src_offset];
+      let length = self.spans[src_offset + 1];
+      let ts_classification = self.spans[src_offset + 2];
+
+      let token_type =
+        Classifications::get_token_type_from_classification(ts_classification);
+      let token_modifiers =
+        Classifications::get_token_modifier_from_classification(
+          ts_classification,
+        );
+
+      let start_pos = line_index.position_tsc(offset.into());
+      let end_pos = line_index.position_tsc(TextSize::from(offset + length));
+
+      // start_pos.line == end_pos.line is always true as there are no multiline tokens
+      builder.push(
+        start_pos.line,
+        start_pos.character,
+        end_pos.character - start_pos.character,
+        token_type,
+        token_modifiers,
+      );
+    }
+    builder.build(None)
+  }
+
+  fn get_token_type_from_classification(ts_classification: u32) -> u32 {
+    (ts_classification >> (TsTokenEncodingConsts::TypeOffset as u32)) - 1
+  }
+
+  fn get_token_modifier_from_classification(ts_classification: u32) -> u32 {
+    ts_classification & (TsTokenEncodingConsts::ModifierMask as u32)
   }
 }
 
@@ -2150,6 +2286,8 @@ pub enum RequestMethod {
   GetDiagnostics(Vec<ModuleSpecifier>),
   /// Return document highlights at position.
   GetDocumentHighlights((ModuleSpecifier, u32, Vec<ModuleSpecifier>)),
+  /// Get semantic highlights information for a particular file.
+  GetEncodedSemanticClassifications((ModuleSpecifier, TextSpan)),
   /// Get implementation information for a specific position.
   GetImplementation((ModuleSpecifier, u32)),
   /// Get a "navigation tree" for a specifier.
@@ -2259,6 +2397,14 @@ impl RequestMethod {
         "position": position,
         "filesToSearch": files_to_search,
       }),
+      RequestMethod::GetEncodedSemanticClassifications((specifier, span)) => {
+        json!({
+          "id": id,
+          "method": "getEncodedSemanticClassifications",
+          "specifier": specifier,
+          "span": span,
+        })
+      }
       RequestMethod::GetImplementation((specifier, position)) => json!({
         "id": id,
         "method": "getImplementation",
