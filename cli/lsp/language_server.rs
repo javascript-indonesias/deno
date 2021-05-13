@@ -91,7 +91,7 @@ pub(crate) struct Inner {
   /// are part of the TypeScript snapshot and have to be fetched out.
   assets: Assets,
   /// The LSP client that this LSP server is connected to.
-  client: Client,
+  pub(crate) client: Client,
   /// Configuration information.
   config: Config,
   diagnostics_server: diagnostics::DiagnosticsServer,
@@ -117,9 +117,9 @@ pub(crate) struct Inner {
   /// A memoized version of fixable diagnostic codes retrieved from TypeScript.
   ts_fixable_diagnostics: Vec<String>,
   /// An abstraction that handles interactions with TypeScript.
-  ts_server: Arc<TsServer>,
+  pub(crate) ts_server: Arc<TsServer>,
   /// A map of specifiers and URLs used to translate over the LSP.
-  pub url_map: urls::LspUrlMap,
+  pub(crate) url_map: urls::LspUrlMap,
 }
 
 impl LanguageServer {
@@ -594,25 +594,26 @@ impl Inner {
     let specifier = self.url_map.normalize_url(&params.text_document.uri);
 
     // we only query the individual resource file if the client supports it
-    if self.config.client_capabilities.workspace_configuration
-      && !self.config.contains(&specifier)
-    {
-      if let Ok(value) = self
-        .client
-        .configuration(vec![ConfigurationItem {
-          scope_uri: Some(params.text_document.uri.clone()),
-          section: Some(SETTINGS_SECTION.to_string()),
-        }])
-        .await
-      {
-        if let Err(err) = self
-          .config
-          .update_specifier(specifier.clone(), value[0].clone())
-        {
-          warn!("Error updating specifier configuration: {}", err);
-        }
-      }
-    }
+    // TODO(@kitsonk) workaround https://github.com/denoland/deno/issues/10603
+    // if self.config.client_capabilities.workspace_configuration
+    //   && !self.config.contains(&specifier)
+    // {
+    //   if let Ok(value) = self
+    //     .client
+    //     .configuration(vec![ConfigurationItem {
+    //       scope_uri: Some(params.text_document.uri.clone()),
+    //       section: Some(SETTINGS_SECTION.to_string()),
+    //     }])
+    //     .await
+    //   {
+    //     if let Err(err) = self
+    //       .config
+    //       .update_specifier(specifier.clone(), value[0].clone())
+    //     {
+    //       warn!("Error updating specifier configuration: {}", err);
+    //     }
+    //   }
+    // }
 
     if params.text_document.uri.scheme() == "deno" {
       // we can ignore virtual text documents opening, as they don't need to
@@ -959,12 +960,8 @@ impl Inner {
     let mut code_actions = CodeActionCollection::default();
     let file_diagnostics = self
       .diagnostics_server
-      .get(specifier.clone(), DiagnosticSource::TypeScript)
-      .await
-      .map_err(|err| {
-        error!("Unable to get diagnostics: {}", err);
-        LspError::internal_error()
-      })?;
+      .get(&specifier, DiagnosticSource::TypeScript)
+      .await;
     for diagnostic in &fixable_diagnostics {
       match diagnostic.source.as_deref() {
         Some("deno-ts") => {
@@ -2484,13 +2481,7 @@ impl Inner {
       if let Some(source) = self.documents.content(&referrer).unwrap() {
         self.analyze_dependencies(&referrer, &source);
       }
-      self
-        .diagnostics_server
-        .invalidate(referrer)
-        .map_err(|err| {
-          error!("{}", err);
-          LspError::internal_error()
-        })?;
+      self.diagnostics_server.invalidate(&referrer).await;
     }
 
     self.diagnostics_server.update().map_err(|err| {
@@ -4608,7 +4599,7 @@ mod tests {
         LspFixture::Path("did_open_notification_code_action.json"),
         LspResponse::None,
       ),
-      (LspFixture::None, LspResponse::Delay(500)),
+      (LspFixture::None, LspResponse::Delay(20000)),
       (
         LspFixture::Path("code_action_request.json"),
         LspResponse::RequestFixture(2, "code_action_response.json".to_string()),

@@ -1013,7 +1013,8 @@ mod integration {
       temp_directory.close().unwrap();
     }
 
-    #[cfg(unix)]
+    // TODO(bartlomieju): flaky (https://github.com/denoland/deno/issues/10552)
+    #[ignore]
     #[test]
     fn test_watch() {
       macro_rules! assert_contains {
@@ -5582,6 +5583,7 @@ console.log("finish");
     assert_eq!(output.stdout, "Welcome to Deno!\n".as_bytes());
   }
 
+  #[ignore]
   #[test]
   #[cfg(windows)]
   // https://github.com/denoland/deno/issues/9667
