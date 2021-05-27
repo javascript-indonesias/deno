@@ -204,11 +204,12 @@ pub fn create_main_worker(
     no_color: !colors::use_color(),
     get_error_class_fn: Some(&crate::errors::get_error_class_name),
     location: program_state.flags.location.clone(),
-    location_data_dir: program_state.flags.location.clone().map(|loc| {
+    origin_storage_dir: program_state.flags.location.clone().map(|loc| {
       program_state
         .dir
         .root
         .clone()
+        // TODO(@crowlKats): change to origin_data for 2.0
         .join("location_data")
         .join(checksum::gen(&[loc.to_string().as_bytes()]))
     }),
@@ -267,19 +268,34 @@ where
 fn print_cache_info(
   state: &Arc<ProgramState>,
   json: bool,
+  location: Option<deno_core::url::Url>,
 ) -> Result<(), AnyError> {
   let deno_dir = &state.dir.root;
   let modules_cache = &state.file_fetcher.get_http_cache_location();
   let typescript_cache = &state.dir.gen_cache.location;
   let registry_cache =
     &state.dir.root.join(lsp::language_server::REGISTRIES_PATH);
+  let mut origin_dir = state.dir.root.join("location_data");
+
+  if let Some(location) = &location {
+    origin_dir =
+      origin_dir.join(&checksum::gen(&[location.to_string().as_bytes()]));
+  }
+
   if json {
-    let output = json!({
-        "denoDir": deno_dir,
-        "modulesCache": modules_cache,
-        "typescriptCache": typescript_cache,
-        "registryCache": registry_cache,
+    let mut output = json!({
+      "denoDir": deno_dir,
+      "modulesCache": modules_cache,
+      "typescriptCache": typescript_cache,
+      "registryCache": registry_cache,
+      "originStorage": origin_dir,
     });
+
+    if location.is_some() {
+      output["localStorage"] =
+        serde_json::to_value(origin_dir.join("local_storage"))?;
+    }
+
     write_json_to_stdout(&output)
   } else {
     println!("{} {:?}", colors::bold("DENO_DIR location:"), deno_dir);
@@ -298,6 +314,14 @@ fn print_cache_info(
       colors::bold("Language server registries cache:"),
       registry_cache,
     );
+    println!("{} {:?}", colors::bold("Origin storage:"), origin_dir);
+    if location.is_some() {
+      println!(
+        "{} {:?}",
+        colors::bold("Local Storage:"),
+        origin_dir.join("local_storage"),
+      );
+    }
     Ok(())
   }
 }
@@ -393,6 +417,7 @@ async fn info_command(
   maybe_specifier: Option<String>,
   json: bool,
 ) -> Result<(), AnyError> {
+  let location = flags.location.clone();
   let program_state = ProgramState::build(flags).await?;
   if let Some(specifier) = maybe_specifier {
     let specifier = resolve_url_or_path(&specifier)?;
@@ -420,7 +445,7 @@ async fn info_command(
     }
   } else {
     // If it was just "deno info" print location of caches and exit
-    print_cache_info(&program_state, json)
+    print_cache_info(&program_state, json, location)
   }
 }
 
@@ -534,7 +559,7 @@ async fn eval_command(
   debug!("main_module {}", &main_module);
   worker.execute_module(&main_module).await?;
   worker.execute("window.dispatchEvent(new Event('load'))")?;
-  worker.run_event_loop().await?;
+  worker.run_event_loop(false).await?;
   worker.execute("window.dispatchEvent(new Event('unload'))")?;
   Ok(())
 }
@@ -737,7 +762,7 @@ async fn run_repl(flags: Flags) -> Result<(), AnyError> {
   let program_state = ProgramState::build(flags).await?;
   let mut worker =
     create_main_worker(&program_state, main_module.clone(), permissions, false);
-  worker.run_event_loop().await?;
+  worker.run_event_loop(false).await?;
 
   tools::repl::run(&program_state, worker).await
 }
@@ -770,7 +795,7 @@ async fn run_from_stdin(flags: Flags) -> Result<(), AnyError> {
   debug!("main_module {}", main_module);
   worker.execute_module(&main_module).await?;
   worker.execute("window.dispatchEvent(new Event('load'))")?;
-  worker.run_event_loop().await?;
+  worker.run_event_loop(false).await?;
   worker.execute("window.dispatchEvent(new Event('unload'))")?;
   Ok(())
 }
@@ -839,7 +864,7 @@ async fn run_with_watch(flags: Flags, script: String) -> Result<(), AnyError> {
         debug!("main_module {}", main_module);
         worker.execute_module(&main_module).await?;
         worker.execute("window.dispatchEvent(new Event('load'))")?;
-        worker.run_event_loop().await?;
+        worker.run_event_loop(false).await?;
         worker.execute("window.dispatchEvent(new Event('unload'))")?;
         Ok(())
       }
@@ -881,7 +906,9 @@ async fn run_command(flags: Flags, script: String) -> Result<(), AnyError> {
   debug!("main_module {}", main_module);
   worker.execute_module(&main_module).await?;
   worker.execute("window.dispatchEvent(new Event('load'))")?;
-  worker.run_event_loop().await?;
+  worker
+    .run_event_loop(maybe_coverage_collector.is_none())
+    .await?;
   worker.execute("window.dispatchEvent(new Event('unload'))")?;
 
   if let Some(coverage_collector) = maybe_coverage_collector.as_mut() {

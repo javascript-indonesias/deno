@@ -273,7 +273,7 @@
         ((init.body !== undefined && init.body !== null) ||
           inputBody !== null)
       ) {
-        throw new TypeError("HEAD and GET requests may not have a body.");
+        throw new TypeError("Request with GET/HEAD method cannot have body.");
       }
 
       // 34.
@@ -402,6 +402,28 @@
   }
 
   mixinBody(Request, _body, _mimeType);
+
+  Object.defineProperty(Request.prototype, "method", {
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(Request.prototype, "url", {
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(Request.prototype, "headers", {
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(Request.prototype, "redirect", {
+    enumerable: true,
+    configurable: true,
+  });
+  Object.defineProperty(Request.prototype, "clone", {
+    enumerable: true,
+    writable: true,
+    configurable: true,
+  });
 
   webidl.converters["Request"] = webidl.createInterfaceConverter(
     "Request",

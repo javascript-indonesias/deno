@@ -193,7 +193,7 @@ pub async fn run(
     no_color: !colors::use_color(),
     get_error_class_fn: Some(&get_error_class_name),
     location: metadata.location,
-    location_data_dir: None,
+    origin_storage_dir: None,
     blob_url_store,
     broadcast_channel,
   };
@@ -202,7 +202,7 @@ pub async fn run(
   worker.bootstrap(&options);
   worker.execute_module(&main_module).await?;
   worker.execute("window.dispatchEvent(new Event('load'))")?;
-  worker.run_event_loop().await?;
+  worker.run_event_loop(true).await?;
   worker.execute("window.dispatchEvent(new Event('unload'))")?;
   std::process::exit(0);
 }

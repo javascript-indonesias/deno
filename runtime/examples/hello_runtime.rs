@@ -41,7 +41,7 @@ async fn main() -> Result<(), AnyError> {
     no_color: false,
     get_error_class_fn: Some(&get_error_class_name),
     location: None,
-    location_data_dir: None,
+    origin_storage_dir: None,
     blob_url_store: BlobUrlStore::default(),
     broadcast_channel: InMemoryBroadcastChannel::default(),
   };
@@ -55,6 +55,6 @@ async fn main() -> Result<(), AnyError> {
     MainWorker::from_options(main_module.clone(), permissions, &options);
   worker.bootstrap(&options);
   worker.execute_module(&main_module).await?;
-  worker.run_event_loop().await?;
+  worker.run_event_loop(false).await?;
   Ok(())
 }
