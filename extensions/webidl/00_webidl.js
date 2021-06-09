@@ -331,29 +331,28 @@
   converters.USVString = (V, opts) => {
     const S = converters.DOMString(V, opts);
     const n = S.length;
-    const U = [];
+    let U = "";
     for (let i = 0; i < n; ++i) {
       const c = S.charCodeAt(i);
       if (c < 0xd800 || c > 0xdfff) {
-        U.push(String.fromCodePoint(c));
+        U += String.fromCodePoint(c);
       } else if (0xdc00 <= c && c <= 0xdfff) {
-        U.push(String.fromCodePoint(0xfffd));
+        U += String.fromCodePoint(0xfffd);
       } else if (i === n - 1) {
-        U.push(String.fromCodePoint(0xfffd));
+        U += String.fromCodePoint(0xfffd);
       } else {
         const d = S.charCodeAt(i + 1);
         if (0xdc00 <= d && d <= 0xdfff) {
           const a = c & 0x3ff;
           const b = d & 0x3ff;
-          U.push(String.fromCodePoint((2 << 15) + (2 << 9) * a + b));
+          U += String.fromCodePoint((2 << 15) + (2 << 9) * a + b);
           ++i;
         } else {
-          U.push(String.fromCodePoint(0xfffd));
+          U += String.fromCodePoint(0xfffd);
         }
       }
     }
-
-    return U.join("");
+    return U;
   };
 
   converters.object = (V, opts) => {
@@ -898,6 +897,26 @@
     return Object.assign(prototype.prototype, methods);
   }
 
+  function configurePrototype(prototype) {
+    const descriptors = Object.getOwnPropertyDescriptors(prototype.prototype);
+    for (const key in descriptors) {
+      if (key === "constructor") continue;
+      const descriptor = descriptors[key];
+      if ("value" in descriptor && typeof descriptor.value === "function") {
+        Object.defineProperty(prototype.prototype, key, {
+          enumerable: true,
+          writable: true,
+          configurable: true,
+        });
+      } else if ("get" in descriptor) {
+        Object.defineProperty(prototype.prototype, key, {
+          enumerable: true,
+          configurable: true,
+        });
+      }
+    }
+  }
+
   window.__bootstrap ??= {};
   window.__bootstrap.webidl = {
     makeException,
@@ -914,5 +933,6 @@
     assertBranded,
     illegalConstructor,
     mixinPairIterable,
+    configurePrototype,
   };
 })(this);

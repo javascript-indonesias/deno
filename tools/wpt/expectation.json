@@ -19,7 +19,7 @@
       "pbkdf2.https.any.html?8001-last": false
     },
     "digest": {
-      "digest.https.any.html": false
+      "digest.https.any.html": true
     },
     "encrypt_decrypt": {
       "aes_cbc.https.any.html": false,
@@ -70,11 +70,11 @@
       "successes_RSASSA-PKCS1-v1_5.https.any.html?21-30": false,
       "successes_RSASSA-PKCS1-v1_5.https.any.html?31-last": false
     },
-    "historical.any.html": true,
+    "historical.any.html": [
+      "Non-secure context window does not have access to crypto.subtle",
+      "Non-secure context window does not have access to SubtleCrypto"
+    ],
     "idlharness.https.any.html": [
-      "Crypto interface: attribute subtle",
-      "Crypto interface: operation getRandomValues(ArrayBufferView)",
-      "Crypto interface: crypto must inherit property \"subtle\" with the proper type",
       "CryptoKey interface: existence and properties of interface object",
       "CryptoKey interface object length",
       "CryptoKey interface object name",
@@ -85,12 +85,6 @@
       "CryptoKey interface: attribute extractable",
       "CryptoKey interface: attribute algorithm",
       "CryptoKey interface: attribute usages",
-      "SubtleCrypto interface: existence and properties of interface object",
-      "SubtleCrypto interface object length",
-      "SubtleCrypto interface object name",
-      "SubtleCrypto interface: existence and properties of interface prototype object",
-      "SubtleCrypto interface: existence and properties of interface prototype object's \"constructor\" property",
-      "SubtleCrypto interface: existence and properties of interface prototype object's @@unscopables property",
       "SubtleCrypto interface: operation encrypt(AlgorithmIdentifier, CryptoKey, BufferSource)",
       "SubtleCrypto interface: operation decrypt(AlgorithmIdentifier, CryptoKey, BufferSource)",
       "SubtleCrypto interface: operation sign(AlgorithmIdentifier, CryptoKey, BufferSource)",
@@ -103,7 +97,6 @@
       "SubtleCrypto interface: operation exportKey(KeyFormat, CryptoKey)",
       "SubtleCrypto interface: operation wrapKey(KeyFormat, CryptoKey, CryptoKey, AlgorithmIdentifier)",
       "SubtleCrypto interface: operation unwrapKey(KeyFormat, BufferSource, CryptoKey, AlgorithmIdentifier, AlgorithmIdentifier, boolean, sequence<KeyUsage>)",
-      "SubtleCrypto must be primary interface of crypto.subtle",
       "Stringification of crypto.subtle",
       "SubtleCrypto interface: crypto.subtle must inherit property \"encrypt(AlgorithmIdentifier, CryptoKey, BufferSource)\" with the proper type",
       "SubtleCrypto interface: calling encrypt(AlgorithmIdentifier, CryptoKey, BufferSource) on crypto.subtle with too few arguments must throw TypeError",
@@ -113,8 +106,6 @@
       "SubtleCrypto interface: calling sign(AlgorithmIdentifier, CryptoKey, BufferSource) on crypto.subtle with too few arguments must throw TypeError",
       "SubtleCrypto interface: crypto.subtle must inherit property \"verify(AlgorithmIdentifier, CryptoKey, BufferSource, BufferSource)\" with the proper type",
       "SubtleCrypto interface: calling verify(AlgorithmIdentifier, CryptoKey, BufferSource, BufferSource) on crypto.subtle with too few arguments must throw TypeError",
-      "SubtleCrypto interface: crypto.subtle must inherit property \"digest(AlgorithmIdentifier, BufferSource)\" with the proper type",
-      "SubtleCrypto interface: calling digest(AlgorithmIdentifier, BufferSource) on crypto.subtle with too few arguments must throw TypeError",
       "SubtleCrypto interface: crypto.subtle must inherit property \"generateKey(AlgorithmIdentifier, boolean, sequence<KeyUsage>)\" with the proper type",
       "SubtleCrypto interface: calling generateKey(AlgorithmIdentifier, boolean, sequence<KeyUsage>) on crypto.subtle with too few arguments must throw TypeError",
       "SubtleCrypto interface: crypto.subtle must inherit property \"deriveKey(AlgorithmIdentifier, CryptoKey, AlgorithmIdentifier, boolean, sequence<KeyUsage>)\" with the proper type",
@@ -242,7 +233,8 @@
     "textdecoder-utf16-surrogates.any.html": true,
     "textencoder-constructor-non-utf.any.html": true,
     "textencoder-utf16-surrogates.any.html": true,
-    "unsupported-encodings.any.html": false
+    "unsupported-encodings.any.html": false,
+    "single-byte-decoder.window.html?TextDecoder": true
   },
   "hr-time": {
     "monotonic-clock.any.html": true,
@@ -515,6 +507,7 @@
         "calling respond() twice on the same byobRequest should throw",
         "calling respondWithNewView() twice on the same byobRequest should throw",
         "calling respond(0) twice on the same byobRequest should throw even when closed",
+        "calling respond() should throw when canceled",
         "pull() resolving should not make releaseLock() possible",
         "ReadableStream with byte source: default reader + autoAllocateChunkSize + byobRequest interaction",
         "ReadableStream with byte source: respondWithNewView() with a smaller view",
@@ -642,7 +635,7 @@
     "jsapi": {
       "constructor": {
         "compile.any.html": true,
-        "instantiate-bad-imports.any.html": false,
+        "instantiate-bad-imports.any.html": true,
         "instantiate.any.html": [
           "Synchronous options handling: Buffer argument"
         ],
@@ -661,21 +654,15 @@
         "Table interface: operation set(unsigned long, optional any)"
       ],
       "instance": {
-        "constructor-bad-imports.any.html": false,
+        "constructor-bad-imports.any.html": true,
         "constructor-caching.any.html": true,
         "constructor.any.html": true,
-        "exports.any.html": [
-          "Setting (sloppy mode)"
-        ],
+        "exports.any.html": true,
         "toString.any.html": true
       },
-      "interface.any.html": [
-        "WebAssembly: property descriptor"
-      ],
+      "interface.any.html": true,
       "memory": {
-        "buffer.any.html": [
-          "Setting (sloppy mode)"
-        ],
+        "buffer.any.html": true,
         "constructor.any.html": true,
         "grow.any.html": true,
         "toString.any.html": true,
@@ -695,9 +682,7 @@
         "constructor.any.html": true,
         "get-set.any.html": true,
         "grow.any.html": true,
-        "length.any.html": [
-          "Setting (sloppy mode)"
-        ],
+        "length.any.html": true,
         "toString.any.html": true,
         "constructor-reftypes.tentative.any.html": [
           "initialize externref table with default value",
@@ -1044,11 +1029,6 @@
         "redirect-to-dataurl.any.html": true
       },
       "idlharness.any.html": [
-        "Headers interface: operation append(ByteString, ByteString)",
-        "Headers interface: operation delete(ByteString)",
-        "Headers interface: operation get(ByteString)",
-        "Headers interface: operation has(ByteString)",
-        "Headers interface: operation set(ByteString, ByteString)",
         "Headers interface: iterable<ByteString, ByteString>",
         "Request interface: attribute destination",
         "Request interface: attribute referrer",
@@ -1060,7 +1040,6 @@
         "Request interface: attribute keepalive",
         "Request interface: attribute isReloadNavigation",
         "Request interface: attribute isHistoryNavigation",
-        "Request interface: attribute signal",
         "Request interface: attribute body",
         "Request interface: attribute bodyUsed",
         "Request interface: new Request('about:blank') must inherit property \"destination\" with the proper type",
@@ -1073,14 +1052,22 @@
         "Request interface: new Request('about:blank') must inherit property \"keepalive\" with the proper type",
         "Request interface: new Request('about:blank') must inherit property \"isReloadNavigation\" with the proper type",
         "Request interface: new Request('about:blank') must inherit property \"isHistoryNavigation\" with the proper type",
-        "Request interface: new Request('about:blank') must inherit property \"signal\" with the proper type",
         "Response interface: operation error()",
         "Response interface: operation redirect(USVString, optional unsigned short)",
         "Response interface: attribute body",
         "Response interface: attribute bodyUsed",
         "Response interface: calling redirect(USVString, optional unsigned short) on new Response() with too few arguments must throw TypeError",
         "Window interface: operation fetch(RequestInfo, optional RequestInit)"
-      ]
+      ],
+      "abort": {
+        "general.any.html": [
+          "response.arrayBuffer() rejects if already aborted",
+          "response.blob() rejects if already aborted",
+          "response.formData() rejects if already aborted",
+          "response.json() rejects if already aborted",
+          "response.text() rejects if already aborted"
+        ]
+      }
     },
     "data-urls": {
       "base64.any.html": true,

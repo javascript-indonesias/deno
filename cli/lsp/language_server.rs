@@ -243,7 +243,10 @@ impl Inner {
   // moment
   /// Searches already cached assets and documents and returns its text
   /// content. If not found, `None` is returned.
-  fn get_text_content(&self, specifier: &ModuleSpecifier) -> Option<String> {
+  pub(crate) fn get_text_content(
+    &self,
+    specifier: &ModuleSpecifier,
+  ) -> Option<String> {
     if specifier.scheme() == "asset" {
       self
         .assets
@@ -253,6 +256,17 @@ impl Inner {
       self.documents.content(specifier).unwrap()
     } else {
       self.sources.get_source(specifier)
+    }
+  }
+
+  pub(crate) fn get_media_type(
+    &self,
+    specifier: &ModuleSpecifier,
+  ) -> Option<MediaType> {
+    if specifier.scheme() == "asset" || self.documents.contains_key(specifier) {
+      Some(MediaType::from(specifier))
+    } else {
+      self.sources.get_media_type(specifier)
     }
   }
 
@@ -347,9 +361,13 @@ impl Inner {
           import_map_str
         ))
       }?;
-      let import_map_path = import_map_url
-        .to_file_path()
-        .map_err(|_| anyhow!("Bad file path."))?;
+      let import_map_path = import_map_url.to_file_path().map_err(|_| {
+        anyhow!("Cannot convert \"{}\" into a file path.", import_map_url)
+      })?;
+      info!(
+        "  Resolved import map: \"{}\"",
+        import_map_path.to_string_lossy()
+      );
       let import_map_json =
         fs::read_to_string(import_map_path).await.map_err(|err| {
           anyhow!(
@@ -446,6 +464,7 @@ impl Inner {
           config_str
         ))
       }?;
+      info!("  Resolved configuration file: \"{}\"", config_url);
 
       let config_file = {
         let buffer = config_url
@@ -513,6 +532,9 @@ impl Inner {
       env!("TARGET")
     );
     info!("  version: {}", version);
+    if let Ok(path) = std::env::current_exe() {
+      info!("  executable: {}", path.to_string_lossy());
+    }
 
     let server_info = ServerInfo {
       name: "deno-language-server".to_string(),
@@ -1099,15 +1121,15 @@ impl Inner {
     let specifier = self.url_map.normalize_url(&params.text_document.uri);
     if !self.documents.is_diagnosable(&specifier)
       || !self.config.specifier_enabled(&specifier)
-      || !self.config.get_workspace_settings().enabled_code_lens()
+      || !(self.config.get_workspace_settings().enabled_code_lens()
+        || self.config.specifier_code_lens_test(&specifier))
     {
       return Ok(None);
     }
 
     let mark = self.performance.mark("code_lens", Some(&params));
-    let code_lenses = code_lens::tsc_code_lenses(&specifier, self)
-      .await
-      .map_err(|err| {
+    let code_lenses =
+      code_lens::collect(&specifier, self).await.map_err(|err| {
         error!("Error getting code lenses for \"{}\": {}", specifier, err);
         LspError::internal_error()
       })?;

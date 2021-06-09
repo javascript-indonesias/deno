@@ -48,6 +48,7 @@
    * @property {string} statusMessage
    * @property {[string, string][]} headerList
    * @property {null | typeof __window.bootstrap.fetchBody.InnerBody} body
+   * @property {boolean} aborted
    * @property {string} [error]
    */
 
@@ -92,12 +93,14 @@
       urlList,
       status: response.status,
       statusMessage: response.statusMessage,
+      aborted: response.aborted,
     };
   }
 
   const defaultInnerResponse = {
     type: "default",
     body: null,
+    aborted: false,
     url() {
       if (this.urlList.length == 0) return null;
       return this.urlList[this.urlList.length - 1];
@@ -125,6 +128,15 @@
     const resp = newInnerResponse(0);
     resp.type = "error";
     resp.error = error;
+    return resp;
+  }
+
+  /**
+   * @returns {InnerResponse}
+   */
+  function abortedNetworkError() {
+    const resp = networkError("aborted");
+    resp.aborted = true;
     return resp;
   }
 
@@ -365,39 +377,7 @@
 
   mixinBody(Response, _body, _mimeType);
 
-  Object.defineProperty(Response.prototype, "type", {
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(Response.prototype, "url", {
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(Response.prototype, "redirected", {
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(Response.prototype, "status", {
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(Response.prototype, "ok", {
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(Response.prototype, "statusText", {
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(Response.prototype, "headers", {
-    enumerable: true,
-    configurable: true,
-  });
-  Object.defineProperty(Response.prototype, "clone", {
-    enumerable: true,
-    writable: true,
-    configurable: true,
-  });
+  webidl.configurePrototype(Response);
 
   webidl.converters["Response"] = webidl.createInterfaceConverter(
     "Response",
@@ -446,4 +426,5 @@
   window.__bootstrap.fetch.redirectStatus = redirectStatus;
   window.__bootstrap.fetch.nullBodyStatus = nullBodyStatus;
   window.__bootstrap.fetch.networkError = networkError;
+  window.__bootstrap.fetch.abortedNetworkError = abortedNetworkError;
 })(globalThis);

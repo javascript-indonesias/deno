@@ -45,7 +45,15 @@ where
   let (id, method, _) = client.read_request::<Value>().unwrap();
   assert_eq!(method, "workspace/configuration");
   client
-    .write_response(id, json!({ "enable": true }))
+    .write_response(
+      id,
+      json!({
+        "enable": true,
+        "codeLens": {
+          "test": true
+        }
+      }),
+    )
     .unwrap();
 
   let mut diagnostics = vec![];
@@ -1230,6 +1238,76 @@ fn lsp_code_lens_impl() {
 }
 
 #[test]
+fn lsp_code_lens_test() {
+  let mut client = init("initialize_params_code_lens_test.json");
+  did_open(
+    &mut client,
+    load_fixture("did_open_params_test_code_lens.json"),
+  );
+  let (maybe_res, maybe_err) = client
+    .write_request(
+      "textDocument/codeLens",
+      json!({
+        "textDocument": {
+          "uri": "file:///a/file.ts"
+        }
+      }),
+    )
+    .unwrap();
+  assert!(maybe_err.is_none());
+  assert_eq!(
+    maybe_res,
+    Some(load_fixture("code_lens_response_test.json"))
+  );
+  shutdown(&mut client);
+}
+
+#[test]
+fn lsp_code_lens_test_disabled() {
+  let mut client = init("initialize_params_code_lens_test_disabled.json");
+  client
+    .write_notification(
+      "textDocument/didOpen",
+      load_fixture("did_open_params_test_code_lens.json"),
+    )
+    .unwrap();
+
+  let (id, method, _) = client.read_request::<Value>().unwrap();
+  assert_eq!(method, "workspace/configuration");
+  client
+    .write_response(
+      id,
+      json!({
+        "enable": true,
+        "codeLens": {
+          "test": false
+        }
+      }),
+    )
+    .unwrap();
+
+  let (method, _) = client.read_notification::<Value>().unwrap();
+  assert_eq!(method, "textDocument/publishDiagnostics");
+  let (method, _) = client.read_notification::<Value>().unwrap();
+  assert_eq!(method, "textDocument/publishDiagnostics");
+  let (method, _) = client.read_notification::<Value>().unwrap();
+  assert_eq!(method, "textDocument/publishDiagnostics");
+  let (maybe_res, maybe_err) = client
+    .write_request(
+      "textDocument/codeLens",
+      json!({
+        "textDocument": {
+          "uri": "file:///a/file.ts"
+        }
+      }),
+    )
+    .unwrap();
+  assert!(maybe_err.is_none());
+  assert_eq!(maybe_res, Some(json!([])));
+  shutdown(&mut client);
+}
+
+#[test]
 fn lsp_code_lens_non_doc_nav_tree() {
   let mut client = init("initialize_params.json");
   did_open(
@@ -2156,7 +2234,6 @@ fn lsp_diagnostics_deno_types() {
   shutdown(&mut client);
 }
 
-#[cfg(not(windows))]
 #[test]
 fn lsp_diagnostics_refresh_dependents() {
   let mut client = init("initialize_params.json");
@@ -2264,35 +2341,28 @@ fn lsp_diagnostics_refresh_dependents() {
   assert_eq!(method, "textDocument/publishDiagnostics");
   let (method, _) = client.read_notification::<Value>().unwrap();
   assert_eq!(method, "textDocument/publishDiagnostics");
-  let (method, _) = client.read_notification::<Value>().unwrap();
-  assert_eq!(method, "textDocument/publishDiagnostics");
-  let (method, _) = client.read_notification::<Value>().unwrap();
-  assert_eq!(method, "textDocument/publishDiagnostics");
-  let (method, _) = client.read_notification::<Value>().unwrap();
-  assert_eq!(method, "textDocument/publishDiagnostics");
-  let (method, maybe_params) = client
-    .read_notification::<lsp::PublishDiagnosticsParams>()
+  // ensure that the server publishes any inflight diagnostics
+  std::thread::sleep(std::time::Duration::from_millis(250));
+  client
+    .write_request::<_, _, Value>("shutdown", json!(null))
     .unwrap();
-  assert_eq!(method, "textDocument/publishDiagnostics");
-  assert!(maybe_params.is_some());
-  let params = maybe_params.unwrap();
-  assert!(params.diagnostics.is_empty());
-  let (method, maybe_params) = client
-    .read_notification::<lsp::PublishDiagnosticsParams>()
-    .unwrap();
-  assert_eq!(method, "textDocument/publishDiagnostics");
-  assert!(maybe_params.is_some());
-  let params = maybe_params.unwrap();
-  assert!(params.diagnostics.is_empty());
-  let (method, maybe_params) = client
-    .read_notification::<lsp::PublishDiagnosticsParams>()
-    .unwrap();
-  assert_eq!(method, "textDocument/publishDiagnostics");
-  assert!(maybe_params.is_some());
-  let params = maybe_params.unwrap();
-  assert!(params.diagnostics.is_empty());
+  client.write_notification("exit", json!(null)).unwrap();
 
-  shutdown(&mut client);
+  let queue_len = client.queue_len();
+  assert!(!client.queue_is_empty());
+  for i in 0..queue_len {
+    let (method, maybe_params) = client
+      .read_notification::<lsp::PublishDiagnosticsParams>()
+      .unwrap();
+    assert_eq!(method, "textDocument/publishDiagnostics");
+    // the last 3 diagnostic publishes should be the clear of any diagnostics
+    if queue_len - i <= 3 {
+      assert!(maybe_params.is_some());
+      let params = maybe_params.unwrap();
+      assert!(params.diagnostics.is_empty());
+    }
+  }
+  assert!(client.queue_is_empty());
 }
 
 #[derive(Deserialize)]

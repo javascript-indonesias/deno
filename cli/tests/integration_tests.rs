@@ -3972,6 +3972,11 @@ console.log("finish");
     output: "fix_tsc_file_exists.out",
   });
 
+  itest!(fix_worker_dispatchevent {
+    args: "run --quiet --reload fix_worker_dispatchevent.ts",
+    output: "fix_worker_dispatchevent.ts.out",
+  });
+
   itest!(es_private_fields {
     args: "run --quiet --reload es_private_fields.js",
     output: "es_private_fields.js.out",
@@ -5874,6 +5879,38 @@ console.log("finish");
       .unwrap();
     assert!(output.status.success());
     assert_eq!(output.stdout, b"Hello Deno!\n");
+  }
+
+  #[test]
+  fn standalone_compiler_ops() {
+    let dir = TempDir::new().expect("tempdir fail");
+    let exe = if cfg!(windows) {
+      dir.path().join("standalone_compiler_ops.exe")
+    } else {
+      dir.path().join("standalone_compiler_ops")
+    };
+    let output = util::deno_cmd()
+      .current_dir(util::root_path())
+      .arg("compile")
+      .arg("--unstable")
+      .arg("--output")
+      .arg(&exe)
+      .arg("./cli/tests/standalone_compiler_ops.ts")
+      .stdout(std::process::Stdio::piped())
+      .spawn()
+      .unwrap()
+      .wait_with_output()
+      .unwrap();
+    assert!(output.status.success());
+    let output = Command::new(exe)
+      .stdout(std::process::Stdio::piped())
+      .stderr(std::process::Stdio::piped())
+      .spawn()
+      .unwrap()
+      .wait_with_output()
+      .unwrap();
+    assert!(output.status.success());
+    assert_eq!(output.stdout, b"Hello, Compiler API!\n");
   }
 
   #[test]
