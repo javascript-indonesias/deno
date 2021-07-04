@@ -772,6 +772,9 @@ version = "0.8.1"
 dependencies = [
  "deno_bench_util",
  "deno_core",
+ "deno_url",
+ "deno_web",
+ "deno_webidl",
  "tokio",
 ]
 
@@ -2775,9 +2778,9 @@ dependencies = [
 
 [[package]]
 name = "rusty_v8"
-version = "0.23.0"
+version = "0.25.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5463232950a37ad7337422f362252ac4ea6db897fc0cb63c8acf0cb4e643898a"
+checksum = "13867576f32f57576ebdf32ca98d63b8a58e9d0af084e1b366b41e66699c91a3"
 dependencies = [
  "bitflags",
  "fslock",
@@ -2936,9 +2939,9 @@ dependencies = [
 
 [[package]]
 name = "serde_v8"
-version = "0.6.0"
+version = "0.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6c9f378d38284155eb349b3230914b1151529e4679048430fd4aa3d27160b8f6"
+checksum = "7ee08dee77621b7bf7432a560f382f32a53df98e6a4009bca1f4998d5c90d24a"
 dependencies = [
  "rusty_v8",
  "serde",
@@ -3562,16 +3565,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2dfed899f0eb03f32ee8c6a0aabdb8a7949659e3466561fc0adf54e26d88c5f4"
 dependencies = [
  "winapi-util",
-]
-
-[[package]]
-name = "test_plugin"
-version = "0.0.1"
-dependencies = [
- "deno_core",
- "futures",
- "serde",
- "test_util",
 ]
 
 [[package]]

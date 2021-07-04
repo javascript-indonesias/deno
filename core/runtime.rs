@@ -104,6 +104,7 @@ pub(crate) struct JsRuntimeState {
   pub global_context: Option<v8::Global<v8::Context>>,
   pub(crate) js_recv_cb: Option<v8::Global<v8::Function>>,
   pub(crate) js_macrotask_cb: Option<v8::Global<v8::Function>>,
+  pub(crate) js_wasm_streaming_cb: Option<v8::Global<v8::Function>>,
   pub(crate) pending_promise_exceptions:
     HashMap<v8::Global<v8::Promise>, v8::Global<v8::Value>>,
   pending_dyn_mod_evaluate: VecDeque<DynImportModEvaluate>,
@@ -142,7 +143,7 @@ impl Drop for JsRuntime {
   }
 }
 
-fn v8_init(v8_platform: Option<v8::UniquePtr<v8::Platform>>) {
+fn v8_init(v8_platform: Option<v8::SharedRef<v8::Platform>>) {
   // Include 10MB ICU data file.
   #[repr(C, align(16))]
   struct IcuData([u8; 10144432]);
@@ -150,18 +151,13 @@ fn v8_init(v8_platform: Option<v8::UniquePtr<v8::Platform>>) {
   v8::icu::set_common_data_69(&ICU_DATA.0).unwrap();
 
   let v8_platform = v8_platform
-    .unwrap_or_else(v8::new_default_platform)
-    .unwrap();
+    .unwrap_or_else(|| v8::new_default_platform(0, false).make_shared());
   v8::V8::initialize_platform(v8_platform);
   v8::V8::initialize();
 
   let flags = concat!(
-    // TODO(ry) This makes WASM compile synchronously. Eventually we should
-    // remove this to make it work asynchronously too. But that requires getting
-    // PumpMessageLoop and RunMicrotasks setup correctly.
-    // See https://github.com/denoland/deno/issues/2544
     " --experimental-wasm-threads",
-    " --no-wasm-async-compilation",
+    " --wasm-test-streaming",
     " --harmony-import-assertions",
     " --no-validate-asm",
   );
@@ -205,7 +201,7 @@ pub struct RuntimeOptions {
 
   /// V8 platform instance to use. Used when Deno initializes V8
   /// (which it only does once), otherwise it's silenty dropped.
-  pub v8_platform: Option<v8::UniquePtr<v8::Platform>>,
+  pub v8_platform: Option<v8::SharedRef<v8::Platform>>,
 }
 
 impl JsRuntime {
@@ -291,6 +287,7 @@ impl JsRuntime {
       pending_mod_evaluate: None,
       js_recv_cb: None,
       js_macrotask_cb: None,
+      js_wasm_streaming_cb: None,
       js_error_create_fn,
       pending_ops: FuturesUnordered::new(),
       pending_unref_ops: FuturesUnordered::new(),
@@ -592,6 +589,19 @@ impl JsRuntime {
     }
   }
 
+  fn pump_v8_message_loop(&mut self) {
+    let scope = &mut self.handle_scope();
+    while v8::Platform::pump_message_loop(
+      &v8::V8::get_current_platform(),
+      scope,
+      false, // don't block if there are no tasks
+    ) {
+      // do nothing
+    }
+
+    scope.perform_microtask_checkpoint();
+  }
+
   /// Runs event loop to completion
   ///
   /// This future resolves when:
@@ -623,6 +633,8 @@ impl JsRuntime {
       let state = state_rc.borrow();
       state.waker.register(cx.waker());
     }
+
+    self.pump_v8_message_loop();
 
     // Ops
     {
@@ -657,6 +669,8 @@ impl JsRuntime {
     let has_pending_dyn_module_evaluation =
       !state.pending_dyn_mod_evaluate.is_empty();
     let has_pending_module_evaluation = state.pending_mod_evaluate.is_some();
+    let has_pending_background_tasks =
+      self.v8_isolate().has_pending_background_tasks();
     let inspector_has_active_sessions = self
       .inspector
       .as_ref()
@@ -667,6 +681,7 @@ impl JsRuntime {
       && !has_pending_dyn_imports
       && !has_pending_dyn_module_evaluation
       && !has_pending_module_evaluation
+      && !has_pending_background_tasks
     {
       if wait_for_inspector && inspector_has_active_sessions {
         return Poll::Pending;
@@ -677,7 +692,12 @@ impl JsRuntime {
 
     // Check if more async ops have been dispatched
     // during this turn of event loop.
-    if state.have_unpolled_ops {
+    // If there are any pending background tasks, we also wake the runtime to
+    // make sure we don't miss them.
+    // TODO(andreubotella) The event loop will spin as long as there are pending
+    // background tasks. We should look into having V8 notify us when a
+    // background task is done.
+    if state.have_unpolled_ops || has_pending_background_tasks {
       state.waker.wake();
     }
 
@@ -685,6 +705,7 @@ impl JsRuntime {
       if has_pending_ops
         || has_pending_dyn_imports
         || has_pending_dyn_module_evaluation
+        || has_pending_background_tasks
       {
         // pass, will be polled again
       } else {
@@ -694,7 +715,10 @@ impl JsRuntime {
     }
 
     if has_pending_dyn_module_evaluation {
-      if has_pending_ops || has_pending_dyn_imports {
+      if has_pending_ops
+        || has_pending_dyn_imports
+        || has_pending_background_tasks
+      {
         // pass, will be polled again
       } else {
         let mut msg = "Dynamically imported module evaluation is still pending but there are no pending ops. This situation is often caused by unresolved promise.
@@ -1738,7 +1762,8 @@ pub mod tests {
 
   #[test]
   fn test_heap_limits() {
-    let create_params = v8::Isolate::create_params().heap_limits(0, 20 * 1024);
+    let create_params =
+      v8::Isolate::create_params().heap_limits(0, 3 * 1024 * 1024);
     let mut runtime = JsRuntime::new(RuntimeOptions {
       create_params: Some(create_params),
       ..Default::default()
@@ -1775,13 +1800,14 @@ pub mod tests {
     runtime.add_near_heap_limit_callback(|current_limit, _initial_limit| {
       current_limit * 2
     });
-    runtime.remove_near_heap_limit_callback(20 * 1024);
+    runtime.remove_near_heap_limit_callback(3 * 1024 * 1024);
     assert!(runtime.allocations.near_heap_limit_callback_data.is_none());
   }
 
   #[test]
   fn test_heap_limit_cb_multiple() {
-    let create_params = v8::Isolate::create_params().heap_limits(0, 20 * 1024);
+    let create_params =
+      v8::Isolate::create_params().heap_limits(0, 3 * 1024 * 1024);
     let mut runtime = JsRuntime::new(RuntimeOptions {
       create_params: Some(create_params),
       ..Default::default()
@@ -1956,6 +1982,56 @@ main();
   }
 
   #[test]
+  fn test_pump_message_loop() {
+    run_in_task(|cx| {
+      let mut runtime = JsRuntime::new(RuntimeOptions::default());
+      runtime
+        .execute_script(
+          "pump_message_loop.js",
+          r#"
+function assertEquals(a, b) {
+  if (a === b) return;
+  throw a + " does not equal " + b;
+}
+const sab = new SharedArrayBuffer(16);
+const i32a = new Int32Array(sab);
+globalThis.resolved = false;
+
+(function() {
+  const result = Atomics.waitAsync(i32a, 0, 0);
+  result.value.then(
+    (value) => { assertEquals("ok", value); globalThis.resolved = true; },
+    () => { assertUnreachable();
+  });
+})();
+
+const notify_return_value = Atomics.notify(i32a, 0, 1);
+assertEquals(1, notify_return_value);
+"#,
+        )
+        .unwrap();
+
+      match runtime.poll_event_loop(cx, false) {
+        Poll::Ready(Ok(())) => {}
+        _ => panic!(),
+      };
+
+      // noop script, will resolve promise from first script
+      runtime
+        .execute_script("pump_message_loop2.js", r#"assertEquals(1, 1);"#)
+        .unwrap();
+
+      // check that promise from `Atomics.waitAsync` has been resolved
+      runtime
+        .execute_script(
+          "pump_message_loop3.js",
+          r#"assertEquals(globalThis.resolved, true);"#,
+        )
+        .unwrap();
+    })
+  }
+
+  #[test]
   fn test_core_js_stack_frame() {
     let mut runtime = JsRuntime::new(RuntimeOptions::default());
     // Call non-existent op so we get error from `core.js`
@@ -1967,13 +2043,13 @@ main();
       .unwrap_err();
     let error_string = error.to_string();
     // Test that the script specifier is a URL: `deno:<repo-relative path>`.
-    assert!(error_string.contains("deno:core/core.js"));
+    assert!(error_string.contains("deno:core/01_core.js"));
   }
 
   #[test]
   fn test_v8_platform() {
     let options = RuntimeOptions {
-      v8_platform: Some(v8::new_default_platform()),
+      v8_platform: Some(v8::new_default_platform(0, false).make_shared()),
       ..Default::default()
     };
     let mut runtime = JsRuntime::new(options);
