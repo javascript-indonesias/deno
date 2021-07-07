@@ -123,6 +123,9 @@ fn create_web_worker_callback(
       get_error_class_fn: Some(&crate::errors::get_error_class_name),
       blob_store: program_state.blob_store.clone(),
       broadcast_channel: program_state.broadcast_channel.clone(),
+      shared_array_buffer_store: Some(
+        program_state.shared_array_buffer_store.clone(),
+      ),
     };
 
     let (mut worker, external_handle) = WebWorker::from_options(
@@ -209,6 +212,9 @@ pub fn create_main_worker(
     }),
     blob_store: program_state.blob_store.clone(),
     broadcast_channel: program_state.broadcast_channel.clone(),
+    shared_array_buffer_store: Some(
+      program_state.shared_array_buffer_store.clone(),
+    ),
   };
 
   let mut worker = MainWorker::from_options(main_module, permissions, &options);
@@ -984,6 +990,7 @@ async fn test_command(
   quiet: bool,
   allow_none: bool,
   filter: Option<String>,
+  shuffle: Option<u64>,
   concurrent_jobs: usize,
 ) -> Result<(), AnyError> {
   if let Some(ref coverage_dir) = flags.coverage_dir {
@@ -1172,6 +1179,7 @@ async fn test_command(
           quiet,
           true,
           filter.clone(),
+          shuffle,
           concurrent_jobs,
         )
         .map(|res| res.map(|_| ()))
@@ -1207,6 +1215,7 @@ async fn test_command(
       quiet,
       allow_none,
       filter,
+      shuffle,
       concurrent_jobs,
     )
     .await?;
@@ -1314,6 +1323,7 @@ fn get_subcommand(
       include,
       allow_none,
       filter,
+      shuffle,
       concurrent_jobs,
     } => test_command(
       flags,
@@ -1324,6 +1334,7 @@ fn get_subcommand(
       quiet,
       allow_none,
       filter,
+      shuffle,
       concurrent_jobs,
     )
     .boxed_local(),
