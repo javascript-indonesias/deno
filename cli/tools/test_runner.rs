@@ -35,6 +35,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use std::time::Instant;
 use swc_common::comments::CommentKind;
+use uuid::Uuid;
 
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -263,10 +264,38 @@ where
 pub async fn run_test_file(
   program_state: Arc<ProgramState>,
   main_module: ModuleSpecifier,
-  test_module: ModuleSpecifier,
   permissions: Permissions,
+  quiet: bool,
+  filter: Option<String>,
+  shuffle: Option<u64>,
   channel: Sender<TestEvent>,
 ) -> Result<(), AnyError> {
+  let test_module =
+    deno_core::resolve_path(&format!("{}$deno$test.js", Uuid::new_v4()))?;
+  let test_source = format!(
+    r#"
+      import "{}";
+      await new Promise(resolve => setTimeout(resolve, 0));
+      await Deno[Deno.internal].runTests({});
+  "#,
+    main_module,
+    json!({
+        "disableLog": quiet,
+        "filter": filter,
+        "shuffle": shuffle,
+    })
+  );
+
+  let test_file = File {
+    local: test_module.to_file_path().unwrap(),
+    maybe_types: None,
+    media_type: MediaType::JavaScript,
+    source: test_source.clone(),
+    specifier: test_module.clone(),
+  };
+
+  program_state.file_fetcher.insert_cached(test_file);
+
   let mut worker =
     create_main_worker(&program_state, main_module.clone(), permissions, true);
 
@@ -292,8 +321,6 @@ pub async fn run_test_file(
   } else {
     None
   };
-
-  worker.execute_module(&main_module).await?;
 
   worker.execute_script(
     &located_script_name!(),
@@ -379,6 +406,24 @@ pub async fn run_tests(
         }
 
         for block in blocks_regex.captures_iter(&comment.text) {
+          let maybe_attributes = block.get(1).map(|m| m.as_str().split(' '));
+          let media_type = if let Some(mut attributes) = maybe_attributes {
+            match attributes.next() {
+              Some("js") => MediaType::JavaScript,
+              Some("jsx") => MediaType::Jsx,
+              Some("ts") => MediaType::TypeScript,
+              Some("tsx") => MediaType::Tsx,
+              Some("") => file.media_type,
+              _ => MediaType::Unknown,
+            }
+          } else {
+            file.media_type
+          };
+
+          if media_type == MediaType::Unknown {
+            continue;
+          }
+
           let body = block.get(2).unwrap();
           let text = body.as_str();
 
@@ -398,16 +443,17 @@ pub async fn run_tests(
           let location = parsed_module.get_location(&span);
 
           let specifier = deno_core::resolve_url_or_path(&format!(
-            "{}${}-{}",
+            "{}${}-{}{}",
             location.filename,
             location.line,
             location.line + element.as_str().split('\n').count(),
+            media_type.as_ts_extension(),
           ))?;
 
           let file = File {
             local: specifier.to_file_path().unwrap(),
             maybe_types: None,
-            media_type: MediaType::TypeScript, // media_type.clone(),
+            media_type,
             source: source.clone(),
             specifier: specifier.clone(),
           };
@@ -443,34 +489,13 @@ pub async fn run_tests(
     return Ok(());
   }
 
-  // Because scripts, and therefore worker.execute cannot detect unresolved promises at the moment
-  // we generate a module for the actual test execution.
-  let test_options = json!({
-      "disableLog": quiet,
-      "filter": filter,
-      "shuffle": shuffle,
-  });
-
-  let test_module = deno_core::resolve_path("$deno$test.js")?;
-  let test_source =
-    format!("await Deno[Deno.internal].runTests({});", test_options);
-  let test_file = File {
-    local: test_module.to_file_path().unwrap(),
-    maybe_types: None,
-    media_type: MediaType::JavaScript,
-    source: test_source.clone(),
-    specifier: test_module.clone(),
-  };
-
-  program_state.file_fetcher.insert_cached(test_file);
-
   let (sender, receiver) = channel::<TestEvent>();
 
   let join_handles = test_modules.iter().map(move |main_module| {
     let program_state = program_state.clone();
     let main_module = main_module.clone();
-    let test_module = test_module.clone();
     let permissions = permissions.clone();
+    let filter = filter.clone();
     let sender = sender.clone();
 
     tokio::task::spawn_blocking(move || {
@@ -478,8 +503,10 @@ pub async fn run_tests(
         let future = run_test_file(
           program_state,
           main_module,
-          test_module,
           permissions,
+          quiet,
+          filter,
+          shuffle,
           sender,
         );
 
