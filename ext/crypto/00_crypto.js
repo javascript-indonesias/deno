@@ -852,6 +852,7 @@
      * @param {CryptoKey} key
      * @returns {Promise<any>}
      */
+    // deno-lint-ignore require-await
     async exportKey(format, key) {
       webidl.assertBranded(this, SubtleCrypto);
       const prefix = "Failed to execute 'exportKey' on 'SubtleCrypto'";
@@ -878,7 +879,7 @@
         case "RSASSA-PKCS1-v1_5":
         case "RSA-PSS":
         case "RSA-OAEP": {
-          return await exportKeyRSA(format, key, innerKey);
+          return exportKeyRSA(format, key, innerKey);
         }
         case "AES-CTR":
         case "AES-CBC":
@@ -1467,7 +1468,7 @@
         const keyData = await core.opAsync(
           "op_crypto_generate_key",
           {
-            name: algorithmName,
+            algorithm: "RSA",
             modulusLength: normalizedAlgorithm.modulusLength,
             publicExponent: normalizedAlgorithm.publicExponent,
           },
@@ -1527,7 +1528,7 @@
         const keyData = await core.opAsync(
           "op_crypto_generate_key",
           {
-            name: algorithmName,
+            algorithm: "RSA",
             modulusLength: normalizedAlgorithm.modulusLength,
             publicExponent: normalizedAlgorithm.publicExponent,
           },
@@ -1589,7 +1590,7 @@
           )
         ) {
           const keyData = await core.opAsync("op_crypto_generate_key", {
-            name: algorithmName,
+            algorithm: "EC",
             namedCurve,
           });
           WeakMapPrototypeSet(KEY_STORE, handle, {
@@ -1649,7 +1650,7 @@
           )
         ) {
           const keyData = await core.opAsync("op_crypto_generate_key", {
-            name: algorithmName,
+            algorithm: "EC",
             namedCurve,
           });
           WeakMapPrototypeSet(KEY_STORE, handle, {
@@ -1744,7 +1745,7 @@
 
         // 3-4.
         const keyData = await core.opAsync("op_crypto_generate_key", {
-          name: algorithmName,
+          algorithm: "HMAC",
           hash: normalizedAlgorithm.hash.name,
           length,
         });
@@ -2532,7 +2533,7 @@
     }
   }
 
-  async function exportKeyRSA(format, key, innerKey) {
+  function exportKeyRSA(format, key, innerKey) {
     switch (format) {
       case "pkcs8": {
         // 1.
@@ -2544,12 +2545,10 @@
         }
 
         // 2.
-        const data = await core.opAsync("op_crypto_export_key", {
-          key: innerKey,
-          format: "pkcs8",
+        const data = core.opSync("op_crypto_export_key", {
           algorithm: key[_algorithm].name,
-          hash: key[_algorithm].hash.name,
-        });
+          format: "pkcs8",
+        }, innerKey);
 
         // 3.
         return data.buffer;
@@ -2564,12 +2563,10 @@
         }
 
         // 2.
-        const data = await core.opAsync("op_crypto_export_key", {
-          key: innerKey,
-          format: "spki",
+        const data = core.opSync("op_crypto_export_key", {
           algorithm: key[_algorithm].name,
-          hash: key[_algorithm].hash.name,
-        });
+          format: "spki",
+        }, innerKey);
 
         // 3.
         return data.buffer;
@@ -2589,7 +2586,7 @@
 
     // 3.
     const keyData = await core.opAsync("op_crypto_generate_key", {
-      name: algorithmName,
+      algorithm: "AES",
       length: normalizedAlgorithm.length,
     });
     const handle = {};
