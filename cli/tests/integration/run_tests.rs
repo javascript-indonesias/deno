@@ -1583,6 +1583,23 @@ itest!(worker_close_in_wasm_reactions {
   output: "worker_close_in_wasm_reactions.js.out",
 });
 
+itest!(reference_types_error {
+  args: "run reference_types_error.js",
+  output: "reference_types_error.js.out",
+  exit_code: 1,
+});
+
+itest!(reference_types_error_no_check {
+  args: "run --no-check reference_types_error.js",
+  output_str: Some(""),
+});
+
+itest!(jsx_import_source_error {
+  args: "run --config jsx/deno-jsx-error.jsonc jsx_import_source_no_pragma.tsx",
+  output: "jsx_import_source_error.out",
+  exit_code: 1,
+});
+
 #[test]
 fn no_validate_asm() {
   let output = util::deno_cmd()
@@ -2407,3 +2424,36 @@ fn issue12807() {
     .unwrap();
   assert!(status.success());
 }
+
+itest!(import_assertions_static_import {
+  args: "run --allow-read import_assertions/static_import.ts",
+  output: "import_assertions/static_import.out",
+});
+
+itest!(import_assertions_static_export {
+  args: "run --allow-read import_assertions/static_export.ts",
+  output: "import_assertions/static_export.out",
+});
+
+itest!(import_assertions_static_error {
+  args: "run --allow-read import_assertions/static_error.ts",
+  output: "import_assertions/static_error.out",
+  exit_code: 1,
+});
+
+itest!(import_assertions_dynamic_import {
+  args: "run --allow-read import_assertions/dynamic_import.ts",
+  output: "import_assertions/dynamic_import.out",
+});
+
+itest!(import_assertions_dynamic_error {
+  args: "run --allow-read import_assertions/dynamic_error.ts",
+  output: "import_assertions/dynamic_error.out",
+  exit_code: 1,
+});
+
+itest!(import_assertions_type_check {
+  args: "run --allow-read import_assertions/type_check.ts",
+  output: "import_assertions/type_check.out",
+  exit_code: 1,
+});

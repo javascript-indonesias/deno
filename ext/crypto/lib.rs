@@ -19,6 +19,8 @@ use std::rc::Rc;
 use block_modes::BlockMode;
 use lazy_static::lazy_static;
 use num_traits::cast::FromPrimitive;
+use p256::elliptic_curve::sec1::FromEncodedPoint;
+use p256::pkcs8::FromPrivateKey;
 use rand::rngs::OsRng;
 use rand::rngs::StdRng;
 use rand::thread_rng;
@@ -40,7 +42,6 @@ use rsa::pkcs1::der::Encodable;
 use rsa::pkcs1::FromRsaPrivateKey;
 use rsa::pkcs1::FromRsaPublicKey;
 use rsa::pkcs8::der::asn1;
-use rsa::pkcs8::FromPrivateKey;
 use rsa::BigUint;
 use rsa::PublicKey;
 use rsa::RsaPrivateKey;
@@ -54,12 +55,14 @@ use std::path::PathBuf;
 
 pub use rand; // Re-export rand
 
+mod encrypt;
 mod export_key;
 mod generate_key;
 mod import_key;
 mod key;
 mod shared;
 
+pub use crate::encrypt::op_crypto_encrypt;
 pub use crate::export_key::op_crypto_export_key;
 pub use crate::generate_key::op_crypto_generate_key;
 pub use crate::import_key::op_crypto_import_key;
@@ -67,7 +70,6 @@ use crate::key::Algorithm;
 use crate::key::CryptoHash;
 use crate::key::CryptoNamedCurve;
 use crate::key::HkdfOutput;
-
 use crate::shared::ID_MFG1;
 use crate::shared::ID_P_SPECIFIED;
 use crate::shared::ID_SHA1_OID;
@@ -96,7 +98,7 @@ pub fn init(maybe_seed: Option<u64>) -> Extension {
       ("op_crypto_derive_bits", op_async(op_crypto_derive_bits)),
       ("op_crypto_import_key", op_sync(op_crypto_import_key)),
       ("op_crypto_export_key", op_sync(op_crypto_export_key)),
-      ("op_crypto_encrypt_key", op_async(op_crypto_encrypt_key)),
+      ("op_crypto_encrypt", op_async(op_crypto_encrypt)),
       ("op_crypto_decrypt_key", op_async(op_crypto_decrypt_key)),
       ("op_crypto_subtle_digest", op_async(op_crypto_subtle_digest)),
       ("op_crypto_random_uuid", op_sync(op_crypto_random_uuid)),
@@ -442,8 +444,18 @@ pub async fn op_crypto_verify_key(
       let verify_alg: &EcdsaVerificationAlgorithm =
         args.named_curve.ok_or_else(not_supported)?.try_into()?;
 
-      let private_key = EcdsaKeyPair::from_pkcs8(signing_alg, &*args.key.data)?;
-      let public_key_bytes = private_key.public_key().as_ref();
+      let private_key;
+
+      let public_key_bytes = match args.key.r#type {
+        KeyType::Private => {
+          private_key = EcdsaKeyPair::from_pkcs8(signing_alg, &*args.key.data)?;
+
+          private_key.public_key().as_ref()
+        }
+        KeyType::Public => &*args.key.data,
+        _ => return Err(type_error("Invalid Key format".to_string())),
+      };
+
       let public_key =
         ring::signature::UnparsedPublicKey::new(verify_alg, public_key_bytes);
 
@@ -506,13 +518,40 @@ pub async fn op_crypto_derive_bits(
 
       let public_key = args
         .public_key
-        .ok_or_else(|| type_error("Missing argument publicKey".to_string()))?;
+        .ok_or_else(|| type_error("Missing argument publicKey"))?;
 
       match named_curve {
         CryptoNamedCurve::P256 => {
-          let secret_key = p256::SecretKey::from_pkcs8_der(&args.key.data)?;
-          let public_key =
-            p256::SecretKey::from_pkcs8_der(&public_key.data)?.public_key();
+          let secret_key = p256::SecretKey::from_pkcs8_der(&args.key.data)
+            .map_err(|_| type_error("Unexpected error decoding private key"))?;
+
+          let public_key = match public_key.r#type {
+            KeyType::Private => {
+              p256::SecretKey::from_pkcs8_der(&public_key.data)
+                .map_err(|_| {
+                  type_error("Unexpected error decoding private key")
+                })?
+                .public_key()
+            }
+            KeyType::Public => {
+              let point = p256::EncodedPoint::from_bytes(public_key.data)
+                .map_err(|_| {
+                  type_error("Unexpected error decoding private key")
+                })?;
+
+              let pk: Option<p256::PublicKey> =
+                p256::PublicKey::from_encoded_point(&point);
+
+              if let Some(pk) = pk {
+                pk
+              } else {
+                return Err(type_error(
+                  "Unexpected error decoding private key",
+                ));
+              }
+            }
+            _ => unreachable!(),
+          };
 
           let shared_secret = p256::elliptic_curve::ecdh::diffie_hellman(
             secret_key.to_secret_scalar(),
@@ -561,19 +600,6 @@ pub async fn op_crypto_derive_bits(
   }
 }
 
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct EncryptArg {
-  key: KeyData,
-  algorithm: Algorithm,
-  // RSA-OAEP
-  hash: Option<CryptoHash>,
-  label: Option<ZeroCopyBuf>,
-  // AES-CBC
-  iv: Option<ZeroCopyBuf>,
-  length: Option<usize>,
-}
-
 fn read_rsa_public_key(key_data: KeyData) -> Result<RsaPublicKey, AnyError> {
   let public_key = match key_data.r#type {
     KeyType::Private => {
@@ -583,98 +609,6 @@ fn read_rsa_public_key(key_data: KeyData) -> Result<RsaPublicKey, AnyError> {
     KeyType::Secret => unreachable!("unexpected KeyType::Secret"),
   };
   Ok(public_key)
-}
-
-pub async fn op_crypto_encrypt_key(
-  _state: Rc<RefCell<OpState>>,
-  args: EncryptArg,
-  zero_copy: ZeroCopyBuf,
-) -> Result<ZeroCopyBuf, AnyError> {
-  let data = &*zero_copy;
-  let algorithm = args.algorithm;
-
-  match algorithm {
-    Algorithm::RsaOaep => {
-      let public_key = read_rsa_public_key(args.key)?;
-      let label = args.label.map(|l| String::from_utf8_lossy(&*l).to_string());
-      let mut rng = OsRng;
-      let padding = match args
-        .hash
-        .ok_or_else(|| type_error("Missing argument hash".to_string()))?
-      {
-        CryptoHash::Sha1 => PaddingScheme::OAEP {
-          digest: Box::new(Sha1::new()),
-          mgf_digest: Box::new(Sha1::new()),
-          label,
-        },
-        CryptoHash::Sha256 => PaddingScheme::OAEP {
-          digest: Box::new(Sha256::new()),
-          mgf_digest: Box::new(Sha256::new()),
-          label,
-        },
-        CryptoHash::Sha384 => PaddingScheme::OAEP {
-          digest: Box::new(Sha384::new()),
-          mgf_digest: Box::new(Sha384::new()),
-          label,
-        },
-        CryptoHash::Sha512 => PaddingScheme::OAEP {
-          digest: Box::new(Sha512::new()),
-          mgf_digest: Box::new(Sha512::new()),
-          label,
-        },
-      };
-
-      Ok(
-        public_key
-          .encrypt(&mut rng, padding, data)
-          .map_err(|e| {
-            custom_error("DOMExceptionOperationError", e.to_string())
-          })?
-          .into(),
-      )
-    }
-    Algorithm::AesCbc => {
-      let key = &*args.key.data;
-      let length = args
-        .length
-        .ok_or_else(|| type_error("Missing argument length".to_string()))?;
-      let iv = args
-        .iv
-        .ok_or_else(|| type_error("Missing argument iv".to_string()))?;
-
-      // 2-3.
-      let ciphertext = match length {
-        128 => {
-          // Section 10.3 Step 2 of RFC 2315 https://www.rfc-editor.org/rfc/rfc2315
-          type Aes128Cbc =
-            block_modes::Cbc<aes::Aes128, block_modes::block_padding::Pkcs7>;
-
-          let cipher = Aes128Cbc::new_from_slices(key, &iv)?;
-          cipher.encrypt_vec(data)
-        }
-        192 => {
-          // Section 10.3 Step 2 of RFC 2315 https://www.rfc-editor.org/rfc/rfc2315
-          type Aes192Cbc =
-            block_modes::Cbc<aes::Aes192, block_modes::block_padding::Pkcs7>;
-
-          let cipher = Aes192Cbc::new_from_slices(key, &iv)?;
-          cipher.encrypt_vec(data)
-        }
-        256 => {
-          // Section 10.3 Step 2 of RFC 2315 https://www.rfc-editor.org/rfc/rfc2315
-          type Aes256Cbc =
-            block_modes::Cbc<aes::Aes256, block_modes::block_padding::Pkcs7>;
-
-          let cipher = Aes256Cbc::new_from_slices(key, &iv)?;
-          cipher.encrypt_vec(data)
-        }
-        _ => unreachable!(),
-      };
-
-      Ok(ciphertext.into())
-    }
-    _ => Err(type_error("Unsupported algorithm".to_string())),
-  }
 }
 
 // The parameters field associated with OID id-RSASSA-PSS
