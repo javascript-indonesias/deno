@@ -558,6 +558,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "ctr"
+version = "0.8.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "049bb91fb4aaf0e3c7efa6cd5ef877dbbbd15b39dad06d9948de4ec8a75761ea"
+dependencies = [
+ "cipher",
+]
+
+[[package]]
 name = "cty"
 version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -775,6 +784,7 @@ dependencies = [
  "aes",
  "base64 0.13.0",
  "block-modes",
+ "ctr",
  "deno_core",
  "deno_web",
  "elliptic-curve",
@@ -4593,9 +4603,9 @@ dependencies = [
 
 [[package]]
 name = "v8"
-version = "0.36.0"
+version = "0.37.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "506523e86ccc15982be412bdde87a142771c139e94a8ecedda1da051a079b81d"
+checksum = "79c23626c332f60f29dbed43424b72989e9bac028ef12ac55d959da99abd9a34"
 dependencies = [
  "bitflags",
  "fslock",
