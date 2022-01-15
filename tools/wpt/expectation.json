@@ -3245,12 +3245,14 @@
         "reporterror.any.html": [
           "self.reportError(1)",
           "self.reportError(TypeError)",
-          "self.reportError(undefined)"
+          "self.reportError(undefined)",
+          "self.reportError() doesn't invoke getters"
         ],
         "reporterror.any.worker.html": [
           "self.reportError(1)",
           "self.reportError(TypeError)",
-          "self.reportError(undefined)"
+          "self.reportError(undefined)",
+          "self.reportError() doesn't invoke getters"
         ]
       },
       "structured-clone": {
@@ -4098,7 +4100,13 @@
       "Pattern: [{\"hostname\":\"bad|hostname\"}] Inputs: undefined",
       "Pattern: [] Inputs: [\"https://example.com/\"]",
       "Pattern: [] Inputs: [{}]",
-      "Pattern: [] Inputs: []"
+      "Pattern: [] Inputs: []",
+      "Pattern: [{\"pathname\":\"{:foo}{(.*)bar}\"}] Inputs: [{\"pathname\":\"foobarbaz\"}]",
+      "Pattern: [{\"pathname\":\"{:foo}{bar(.*)}\"}] Inputs: [{\"pathname\":\"foobarbaz\"}]",
+      "Pattern: [{\"pathname\":\"*/*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*\\\\/*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*/{*}\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*//*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]"
     ],
     "urlpattern.any.worker.html": [
       "Pattern: [{\"pathname\":\"/foo/bar\"}] Inputs: [\"./foo/bar\",\"https://example.com\"]",
@@ -4106,7 +4114,13 @@
       "Pattern: [{\"hostname\":\"bad|hostname\"}] Inputs: undefined",
       "Pattern: [] Inputs: [\"https://example.com/\"]",
       "Pattern: [] Inputs: [{}]",
-      "Pattern: [] Inputs: []"
+      "Pattern: [] Inputs: []",
+      "Pattern: [{\"pathname\":\"{:foo}{(.*)bar}\"}] Inputs: [{\"pathname\":\"foobarbaz\"}]",
+      "Pattern: [{\"pathname\":\"{:foo}{bar(.*)}\"}] Inputs: [{\"pathname\":\"foobarbaz\"}]",
+      "Pattern: [{\"pathname\":\"*/*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*\\\\/*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*/{*}\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*//*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]"
     ],
     "urlpattern.https.any.html": [
       "Pattern: [{\"pathname\":\"/foo/bar\"}] Inputs: [\"./foo/bar\",\"https://example.com\"]",
@@ -4114,7 +4128,13 @@
       "Pattern: [{\"hostname\":\"bad|hostname\"}] Inputs: undefined",
       "Pattern: [] Inputs: [\"https://example.com/\"]",
       "Pattern: [] Inputs: [{}]",
-      "Pattern: [] Inputs: []"
+      "Pattern: [] Inputs: []",
+      "Pattern: [{\"pathname\":\"{:foo}{(.*)bar}\"}] Inputs: [{\"pathname\":\"foobarbaz\"}]",
+      "Pattern: [{\"pathname\":\"{:foo}{bar(.*)}\"}] Inputs: [{\"pathname\":\"foobarbaz\"}]",
+      "Pattern: [{\"pathname\":\"*/*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*\\\\/*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*/{*}\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*//*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]"
     ],
     "urlpattern.https.any.worker.html": [
       "Pattern: [{\"pathname\":\"/foo/bar\"}] Inputs: [\"./foo/bar\",\"https://example.com\"]",
@@ -4122,7 +4142,13 @@
       "Pattern: [{\"hostname\":\"bad|hostname\"}] Inputs: undefined",
       "Pattern: [] Inputs: [\"https://example.com/\"]",
       "Pattern: [] Inputs: [{}]",
-      "Pattern: [] Inputs: []"
+      "Pattern: [] Inputs: []",
+      "Pattern: [{\"pathname\":\"{:foo}{(.*)bar}\"}] Inputs: [{\"pathname\":\"foobarbaz\"}]",
+      "Pattern: [{\"pathname\":\"{:foo}{bar(.*)}\"}] Inputs: [{\"pathname\":\"foobarbaz\"}]",
+      "Pattern: [{\"pathname\":\"*/*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*\\\\/*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*/{*}\"}] Inputs: [{\"pathname\":\"foo/bar\"}]",
+      "Pattern: [{\"pathname\":\"*//*\"}] Inputs: [{\"pathname\":\"foo/bar\"}]"
     ]
   }
 }
