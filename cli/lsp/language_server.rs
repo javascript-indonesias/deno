@@ -37,6 +37,7 @@ use super::config::ConfigSnapshot;
 use super::config::SETTINGS_SECTION;
 use super::diagnostics;
 use super::diagnostics::DiagnosticSource;
+use super::diagnostics::DiagnosticsServer;
 use super::documents::to_hover_text;
 use super::documents::to_lsp_range;
 use super::documents::AssetOrDocument;
@@ -51,6 +52,7 @@ use super::text;
 use super::tsc;
 use super::tsc::AssetDocument;
 use super::tsc::Assets;
+use super::tsc::AssetsSnapshot;
 use super::tsc::TsServer;
 use super::urls;
 use crate::config_file::ConfigFile;
@@ -74,13 +76,12 @@ pub struct LanguageServer(Arc<tokio::sync::Mutex<Inner>>);
 
 #[derive(Debug, Default)]
 pub(crate) struct StateSnapshot {
-  pub assets: Assets,
+  pub assets: AssetsSnapshot,
   pub config: ConfigSnapshot,
   pub documents: Documents,
   pub maybe_lint_config: Option<LintConfig>,
   pub maybe_fmt_config: Option<FmtConfig>,
   pub module_registries: registries::ModuleRegistry,
-  pub performance: Performance,
   pub url_map: urls::LspUrlMap,
 }
 
@@ -118,7 +119,7 @@ pub(crate) struct Inner {
   /// The URL for the import map which is used to determine relative imports.
   maybe_import_map_uri: Option<Url>,
   /// A collection of measurements which instrument that performance of the LSP.
-  performance: Performance,
+  performance: Arc<Performance>,
   /// A memoized version of fixable diagnostic codes retrieved from TypeScript.
   ts_fixable_diagnostics: Vec<String>,
   /// An abstraction that handles interactions with TypeScript.
@@ -143,14 +144,21 @@ impl Inner {
       registries::ModuleRegistry::new(&module_registries_location);
     let location = dir.root.join(CACHE_PATH);
     let documents = Documents::new(&location);
-    let ts_server = Arc::new(TsServer::new());
+    let performance = Arc::new(Performance::default());
+    let ts_server = Arc::new(TsServer::new(performance.clone()));
     let config = Config::new(client.clone());
+    let diagnostics_server = DiagnosticsServer::new(
+      client.clone(),
+      performance.clone(),
+      ts_server.clone(),
+    );
+    let assets = Assets::new(ts_server.clone());
 
     Self {
-      assets: Default::default(),
+      assets,
       client,
       config,
-      diagnostics_server: Default::default(),
+      diagnostics_server,
       documents,
       maybe_cache_path: None,
       maybe_lint_config: None,
@@ -161,7 +169,7 @@ impl Inner {
       maybe_import_map_uri: None,
       module_registries,
       module_registries_location,
-      performance: Default::default(),
+      performance,
       ts_fixable_diagnostics: Default::default(),
       ts_server,
       url_map: Default::default(),
@@ -171,7 +179,7 @@ impl Inner {
   /// Searches assets and open documents which might be performed asynchronously,
   /// hydrating in memory caches for subsequent requests.
   pub(crate) async fn get_asset_or_document(
-    &mut self,
+    &self,
     specifier: &ModuleSpecifier,
   ) -> LspResult<AssetOrDocument> {
     self
@@ -191,7 +199,7 @@ impl Inner {
   /// Searches assets and open documents which might be performed asynchronously,
   /// hydrating in memory caches for subsequent requests.
   pub(crate) async fn get_maybe_asset_or_document(
-    &mut self,
+    &self,
     specifier: &ModuleSpecifier,
   ) -> LspResult<Option<AssetOrDocument>> {
     let mark = self.performance.mark(
@@ -199,7 +207,11 @@ impl Inner {
       Some(json!({ "specifier": specifier })),
     );
     let result = if specifier.scheme() == "asset" {
-      self.get_asset(specifier).await?.map(AssetOrDocument::Asset)
+      self
+        .assets
+        .get(specifier, || self.snapshot())
+        .await?
+        .map(AssetOrDocument::Asset)
     } else {
       self.documents.get(specifier).map(AssetOrDocument::Document)
     };
@@ -235,7 +247,7 @@ impl Inner {
     if specifier.scheme() == "asset" {
       self
         .assets
-        .get(specifier)
+        .get_cached(specifier)
         .map(|maybe_asset| {
           maybe_asset
             .as_ref()
@@ -314,7 +326,23 @@ impl Inner {
       }
     }
 
-    Ok(None)
+    // Auto-discover config
+
+    // It is possible that root_uri is not set, for example when having a single
+    // file open and not a workspace.  In those situations we can't
+    // automatically discover the configuration
+    if let Some(root_uri) = maybe_root_uri {
+      let root_path = root_uri.to_file_path().unwrap();
+      let mut checked = std::collections::HashSet::new();
+      let maybe_config =
+        crate::config_file::discover_from(&root_path, &mut checked)?;
+      Ok(maybe_config.map(|c| {
+        lsp_log!("  Auto-resolved configuration file: \"{}\"", c.specifier);
+        c
+      }))
+    } else {
+      Ok(None)
+    }
   }
 
   fn is_diagnosable(&self, specifier: &ModuleSpecifier) -> bool {
@@ -343,7 +371,7 @@ impl Inner {
   }
 
   fn merge_user_tsconfig(
-    &mut self,
+    &self,
     tsconfig: &mut TsConfig,
   ) -> Result<(), AnyError> {
     if let Some(config_file) = self.maybe_config_file.as_ref() {
@@ -361,7 +389,7 @@ impl Inner {
 
   pub(crate) fn snapshot(&self) -> LspResult<Arc<StateSnapshot>> {
     Ok(Arc::new(StateSnapshot {
-      assets: self.assets.clone(),
+      assets: self.assets.snapshot(),
       config: self.config.snapshot().map_err(|err| {
         error!("{}", err);
         LspError::internal_error()
@@ -370,7 +398,6 @@ impl Inner {
       maybe_lint_config: self.maybe_lint_config.clone(),
       maybe_fmt_config: self.maybe_fmt_config.clone(),
       module_registries: self.module_registries.clone(),
-      performance: self.performance.clone(),
       url_map: self.url_map.clone(),
     }))
   }
@@ -573,25 +600,6 @@ impl Inner {
       .await?;
     self.performance.measure(mark);
     Ok(())
-  }
-
-  async fn get_asset(
-    &mut self,
-    specifier: &ModuleSpecifier,
-  ) -> LspResult<Option<AssetDocument>> {
-    if let Some(maybe_asset) = self.assets.get(specifier) {
-      Ok(maybe_asset.clone())
-    } else {
-      let maybe_asset =
-        tsc::get_asset(specifier, &self.ts_server, self.snapshot()?)
-          .await
-          .map_err(|err| {
-            error!("Error getting asset {}: {}", specifier, err);
-            LspError::internal_error()
-          })?;
-      self.assets.insert(specifier.clone(), maybe_asset.clone());
-      Ok(maybe_asset)
-    }
   }
 }
 
@@ -1057,7 +1065,7 @@ impl Inner {
     }
   }
 
-  async fn hover(&mut self, params: HoverParams) -> LspResult<Option<Hover>> {
+  async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
     let specifier = self
       .url_map
       .normalize_url(&params.text_document_position_params.text_document.uri);
@@ -2360,11 +2368,7 @@ impl lspower::LanguageServer for LanguageServer {
     params: InitializeParams,
   ) -> LspResult<InitializeResult> {
     let mut language_server = self.0.lock().await;
-    let client = language_server.client.clone();
-    let ts_server = language_server.ts_server.clone();
-    language_server
-      .diagnostics_server
-      .start(self.0.clone(), client, ts_server);
+    language_server.diagnostics_server.start(self.0.clone());
     language_server.initialize(params).await
   }
 
