@@ -863,37 +863,25 @@ Deno.test(
     const ev = await httpConn.nextRequest();
     const { respondWith } = ev!;
 
-    const { readable, writable } = new TransformStream<Uint8Array>();
-    const writer = writable.getWriter();
-
-    async function writeResponse() {
-      await delay(50);
-      await writer.write(
-        new TextEncoder().encode(
-          "written to the writable side of a TransformStream",
-        ),
-      );
-      await writer.close();
-    }
-
     const errors: Error[] = [];
 
-    const writePromise = writeResponse()
-      .catch((error: Error) => {
+    const readable = new ReadableStream({
+      async pull(controller) {
+        client.close();
+        await delay(1000);
+        controller.enqueue(new TextEncoder().encode(
+          "written to the writable side of a TransformStream",
+        ));
+        controller.close();
+      },
+      cancel(error) {
         errors.push(error);
-      });
+      },
+    });
 
     const res = new Response(readable);
 
-    const respondPromise = respondWith(res)
-      .catch((error: Error) => errors.push(error));
-
-    client.close();
-
-    await Promise.all([
-      writePromise,
-      respondPromise,
-    ]);
+    await respondWith(res).catch((error: Error) => errors.push(error));
 
     httpConn.close();
     listener.close();
@@ -938,11 +926,11 @@ Deno.test(
     let httpConn: Deno.HttpConn;
 
     const promise = (async () => {
-      listener = Deno.listen({ port: 4502 });
+      listener = Deno.listen({ port: 4508 });
       for await (const conn of listener) {
         httpConn = Deno.serveHttp(conn);
         for await (const { request, respondWith } of httpConn) {
-          assertEquals(new URL(request.url).href, "http://127.0.0.1:4502/");
+          assertEquals(new URL(request.url).href, "http://127.0.0.1:4508/");
           // not reading request body on purpose
           respondWith(new Response("ok"));
         }
@@ -950,7 +938,7 @@ Deno.test(
     })();
 
     const resourcesBefore = Deno.resources();
-    const response = await fetch("http://127.0.0.1:4502", {
+    const response = await fetch("http://127.0.0.1:4508", {
       method: "POST",
       body: "hello world",
     });
