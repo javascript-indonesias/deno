@@ -289,9 +289,9 @@ impl HttpAcceptor {
 }
 
 /// A resource representing a single HTTP request/response stream.
-struct HttpStreamResource {
+pub struct HttpStreamResource {
   conn: Rc<HttpConnResource>,
-  rd: AsyncRefCell<HttpRequestReader>,
+  pub rd: AsyncRefCell<HttpRequestReader>,
   wr: AsyncRefCell<HttpResponseWriter>,
   accept_encoding: RefCell<Encoding>,
   cancel_handle: CancelHandle,
@@ -324,7 +324,7 @@ impl Resource for HttpStreamResource {
 }
 
 /// The read half of an HTTP stream.
-enum HttpRequestReader {
+pub enum HttpRequestReader {
   Headers(Request<Body>),
   Body(Peekable<Body>),
   Closed,
@@ -797,10 +797,7 @@ async fn op_http_read(
 }
 
 #[op]
-fn op_http_websocket_accept_header(
-  _: &mut OpState,
-  key: String,
-) -> Result<String, AnyError> {
+fn op_http_websocket_accept_header(key: String) -> Result<String, AnyError> {
   let digest = ring::digest::digest(
     &ring::digest::SHA1_FOR_LEGACY_USE_ONLY,
     format!("{}258EAFA5-E914-47DA-95CA-C5AB0DC85B11", key).as_bytes(),
