@@ -579,11 +579,24 @@ pub enum DnsReturnRecord {
     preference: u16,
     exchange: String,
   },
+  Naptr {
+    order: u16,
+    preference: u16,
+    flags: String,
+    services: String,
+    regexp: String,
+    replacement: String,
+  },
   Ns(String),
   Ptr(String),
   Soa {
     mname: String,
     rname: String,
+    serial: u32,
+    refresh: i32,
+    retry: i32,
+    expire: i32,
+    minimum: u32,
   },
   Srv {
     priority: u16,
@@ -735,6 +748,14 @@ fn rdata_to_return_record(
         preference: mx.preference(),
         exchange: mx.exchange().to_string(),
       }),
+      NAPTR => r.as_naptr().map(|naptr| DnsReturnRecord::Naptr {
+        order: naptr.order(),
+        preference: naptr.preference(),
+        flags: String::from_utf8(naptr.flags().to_vec()).unwrap(),
+        services: String::from_utf8(naptr.services().to_vec()).unwrap(),
+        regexp: String::from_utf8(naptr.regexp().to_vec()).unwrap(),
+        replacement: naptr.replacement().to_string(),
+      }),
       NS => r.as_ns().map(ToString::to_string).map(DnsReturnRecord::Ns),
       PTR => r
         .as_ptr()
@@ -743,6 +764,11 @@ fn rdata_to_return_record(
       SOA => r.as_soa().map(|soa| DnsReturnRecord::Soa {
         mname: soa.mname().to_string(),
         rname: soa.rname().to_string(),
+        serial: soa.serial(),
+        refresh: soa.refresh(),
+        retry: soa.retry(),
+        expire: soa.expire(),
+        minimum: soa.minimum(),
       }),
       SRV => r.as_srv().map(|srv| DnsReturnRecord::Srv {
         priority: srv.priority(),
@@ -778,6 +804,7 @@ mod tests {
   use std::net::Ipv6Addr;
   use std::path::Path;
   use trust_dns_proto::rr::rdata::mx::MX;
+  use trust_dns_proto::rr::rdata::naptr::NAPTR;
   use trust_dns_proto::rr::rdata::srv::SRV;
   use trust_dns_proto::rr::rdata::txt::TXT;
   use trust_dns_proto::rr::rdata::SOA;
@@ -829,6 +856,30 @@ mod tests {
   }
 
   #[test]
+  fn rdata_to_return_record_naptr() {
+    let func = rdata_to_return_record(RecordType::NAPTR);
+    let rdata = RData::NAPTR(NAPTR::new(
+      1,
+      2,
+      <Box<[u8]>>::default(),
+      <Box<[u8]>>::default(),
+      <Box<[u8]>>::default(),
+      Name::new(),
+    ));
+    assert_eq!(
+      func(&rdata),
+      Some(DnsReturnRecord::Naptr {
+        order: 1,
+        preference: 2,
+        flags: "".to_string(),
+        services: "".to_string(),
+        regexp: "".to_string(),
+        replacement: "".to_string()
+      })
+    );
+  }
+
+  #[test]
   fn rdata_to_return_record_ns() {
     let func = rdata_to_return_record(RecordType::NS);
     let rdata = RData::NS(Name::new());
@@ -858,7 +909,12 @@ mod tests {
       func(&rdata),
       Some(DnsReturnRecord::Soa {
         mname: "".to_string(),
-        rname: "".to_string()
+        rname: "".to_string(),
+        serial: 0,
+        refresh: i32::MAX,
+        retry: i32::MAX,
+        expire: i32::MAX,
+        minimum: 0,
       })
     );
   }
