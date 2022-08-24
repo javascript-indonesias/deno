@@ -963,7 +963,7 @@ async fn main_server(
           return Ok(file_resp);
         } else if should_download_npm_packages() {
           if let Err(err) =
-            download_npm_registry_file(&file_path, is_tarball).await
+            download_npm_registry_file(req.uri(), &file_path, is_tarball).await
           {
             return Response::builder()
               .status(StatusCode::INTERNAL_SERVER_ERROR)
@@ -992,15 +992,21 @@ fn should_download_npm_packages() -> bool {
 }
 
 async fn download_npm_registry_file(
+  uri: &hyper::Uri,
   file_path: &PathBuf,
   is_tarball: bool,
 ) -> Result<(), anyhow::Error> {
-  let package_name = file_path
-    .parent()
+  let url_parts = uri
+    .path()
+    .strip_prefix("/npm/registry/")
     .unwrap()
-    .file_name()
-    .unwrap()
-    .to_string_lossy();
+    .split('/')
+    .collect::<Vec<_>>();
+  let package_name = if url_parts[0].starts_with('@') {
+    url_parts.into_iter().take(2).collect::<Vec<_>>().join("/")
+  } else {
+    url_parts.into_iter().take(1).collect::<Vec<_>>().join("/")
+  };
   let url = if is_tarball {
     let file_name = file_path.file_name().unwrap().to_string_lossy();
     format!(
@@ -1052,6 +1058,7 @@ impl hyper::server::accept::Accept for HyperAcceptor<'_> {
 }
 
 #[allow(clippy::non_send_fields_in_send_ty)]
+// SAFETY: unsafe trait must have unsafe implementation
 unsafe impl std::marker::Send for HyperAcceptor<'_> {}
 
 async fn wrap_redirect_server() {
@@ -1897,12 +1904,14 @@ impl<'a> CheckOutputIntegrationTest<'a> {
     // deno test's output capturing flushes with a zero-width space in order to
     // synchronize the output pipes. Occassionally this zero width space
     // might end up in the output so strip it from the output comparison here.
-    if args.get(0) == Some(&"test") {
+    if args.first() == Some(&"test") {
       actual = actual.replace('\u{200B}', "");
     }
 
     let expected = if let Some(s) = self.output_str {
       s.to_owned()
+    } else if self.output.is_empty() {
+      String::new()
     } else {
       let output_path = testdata_dir.join(self.output);
       println!("output path {}", output_path.display());

@@ -1,7 +1,10 @@
 // Copyright 2018-2022 the Deno authors. All rights reserved. MIT license.
 
 use deno_core::url::Url;
+use std::process::Stdio;
 use test_util as util;
+use util::assert_contains;
+use util::http_server;
 
 // NOTE: It's possible to automatically update the npm registry data in the test server
 // by setting the DENO_TEST_UTIL_UPDATE_NPM=1 environment variable.
@@ -51,6 +54,13 @@ itest!(dynamic_import {
   http_server: true,
 });
 
+itest!(cached_only {
+  args: "run --cached-only --unstable npm/cached_only/main.ts",
+  output: "npm/cached_only/main.out",
+  envs: env_vars(),
+  exit_code: 1,
+});
+
 itest!(import_map {
   args: "run --allow-read --unstable --import-map npm/import_map/import_map.json npm/import_map/main.js",
   output: "npm/import_map/main.out",
@@ -75,6 +85,133 @@ fn parallel_downloading() {
   );
   assert!(out.contains("chalk cjs loads"));
 }
+
+#[test]
+fn cached_only_after_first_run() {
+  let _server = http_server();
+
+  let deno_dir = util::new_deno_dir();
+
+  let deno = util::deno_cmd_with_deno_dir(&deno_dir)
+    .current_dir(util::testdata_path())
+    .arg("run")
+    .arg("--unstable")
+    .arg("--allow-read")
+    .arg("--allow-env")
+    .arg("npm/cached_only_after_first_run/main1.ts")
+    .env("NO_COLOR", "1")
+    .envs(env_vars())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let output = deno.wait_with_output().unwrap();
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert_contains!(stderr, "Download");
+  assert_contains!(stdout, "createChalk: chalk");
+  assert!(output.status.success());
+
+  let deno = util::deno_cmd_with_deno_dir(&deno_dir)
+    .current_dir(util::testdata_path())
+    .arg("run")
+    .arg("--unstable")
+    .arg("--allow-read")
+    .arg("--allow-env")
+    .arg("--cached-only")
+    .arg("npm/cached_only_after_first_run/main2.ts")
+    .env("NO_COLOR", "1")
+    .envs(env_vars())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+  let output = deno.wait_with_output().unwrap();
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert_contains!(
+    stderr,
+    "An npm specifier not found in cache: \"ansi-styles\", --cached-only is specified."
+  );
+  assert!(stdout.is_empty());
+  assert!(!output.status.success());
+
+  let deno = util::deno_cmd_with_deno_dir(&deno_dir)
+    .current_dir(util::testdata_path())
+    .arg("run")
+    .arg("--unstable")
+    .arg("--allow-read")
+    .arg("--allow-env")
+    .arg("--cached-only")
+    .arg("npm/cached_only_after_first_run/main1.ts")
+    .env("NO_COLOR", "1")
+    .envs(env_vars())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::piped())
+    .spawn()
+    .unwrap();
+
+  let output = deno.wait_with_output().unwrap();
+  let stderr = String::from_utf8_lossy(&output.stderr);
+  let stdout = String::from_utf8_lossy(&output.stdout);
+  assert!(output.status.success());
+  assert!(stderr.is_empty());
+  assert_contains!(stdout, "createChalk: chalk");
+}
+
+#[test]
+fn deno_run_cjs_module() {
+  let _server = http_server();
+
+  let deno_dir = util::new_deno_dir();
+
+  let deno = util::deno_cmd_with_deno_dir(&deno_dir)
+    .current_dir(deno_dir.path())
+    .arg("run")
+    .arg("--unstable")
+    .arg("--allow-read")
+    .arg("--allow-env")
+    .arg("--allow-write")
+    .arg("npm:mkdirp@1.0.4")
+    .arg("test_dir")
+    .env("NO_COLOR", "1")
+    .envs(env_vars())
+    .spawn()
+    .unwrap();
+  let output = deno.wait_with_output().unwrap();
+  assert!(output.status.success());
+
+  assert!(deno_dir.path().join("test_dir").exists());
+}
+
+itest!(deno_run_cowsay {
+  args: "run --unstable -A --quiet npm:cowsay@1.5.0 Hello",
+  output: "npm/deno_run_cowsay.out",
+  envs: env_vars_no_sync_download(),
+  http_server: true,
+});
+
+itest!(deno_run_cowsay_explicit {
+  args: "run --unstable -A --quiet npm:cowsay@1.5.0/cowsay Hello",
+  output: "npm/deno_run_cowsay.out",
+  envs: env_vars_no_sync_download(),
+  http_server: true,
+});
+
+itest!(deno_run_cowthink {
+  args: "run --unstable -A --quiet npm:cowsay@1.5.0/cowthink Hello",
+  output: "npm/deno_run_cowthink.out",
+  envs: env_vars_no_sync_download(),
+  http_server: true,
+});
+
+itest!(deno_run_non_existent {
+  args: "run --unstable npm:mkdirp@0.5.125",
+  output: "npm/deno_run_non_existent.out",
+  envs: env_vars(),
+  http_server: true,
+  exit_code: 1,
+});
 
 #[test]
 fn ensure_registry_files_local() {

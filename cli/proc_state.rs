@@ -7,6 +7,7 @@ use crate::args::TypeCheckMode;
 use crate::cache;
 use crate::cache::EmitCache;
 use crate::cache::FastInsecureHasher;
+use crate::cache::ParsedSourceCache;
 use crate::cache::TypeCheckCache;
 use crate::compat;
 use crate::compat::NodeEsmResolver;
@@ -29,6 +30,7 @@ use crate::npm::NpmPackageResolver;
 use crate::resolver::ImportMapResolver;
 use crate::resolver::JsxResolver;
 
+use deno_ast::MediaType;
 use deno_core::anyhow::anyhow;
 use deno_core::anyhow::bail;
 use deno_core::anyhow::Context;
@@ -82,6 +84,7 @@ pub struct Inner {
   pub broadcast_channel: InMemoryBroadcastChannel,
   pub shared_array_buffer_store: SharedArrayBufferStore,
   pub compiled_wasm_module_store: CompiledWasmModuleStore,
+  pub parsed_source_cache: ParsedSourceCache,
   maybe_resolver: Option<Arc<dyn deno_graph::source::Resolver + Send + Sync>>,
   maybe_file_watcher_reporter: Option<FileWatcherReporter>,
   pub npm_resolver: GlobalNpmPackageResolver,
@@ -217,8 +220,13 @@ impl ProcState {
       warn!("{}", ignored_options);
     }
     let emit_cache = EmitCache::new(dir.gen_cache.clone());
-    let npm_resolver =
-      GlobalNpmPackageResolver::from_deno_dir(&dir, cli_options.reload_flag())?;
+    let parsed_source_cache =
+      ParsedSourceCache::new(Some(dir.dep_analysis_db_file_path()));
+    let npm_resolver = GlobalNpmPackageResolver::from_deno_dir(
+      &dir,
+      cli_options.reload_flag(),
+      cli_options.cache_setting(),
+    )?;
 
     Ok(ProcState(Arc::new(Inner {
       dir,
@@ -239,6 +247,7 @@ impl ProcState {
       broadcast_channel,
       shared_array_buffer_store,
       compiled_wasm_module_store,
+      parsed_source_cache,
       maybe_resolver,
       maybe_file_watcher_reporter,
       npm_resolver,
@@ -364,6 +373,7 @@ impl ProcState {
         None
       };
 
+    let analyzer = self.parsed_source_cache.as_analyzer();
     let graph = create_graph(
       roots.clone(),
       is_dynamic,
@@ -371,7 +381,7 @@ impl ProcState {
       &mut loader,
       maybe_resolver,
       maybe_locker,
-      None,
+      Some(&*analyzer),
       maybe_file_watcher_reporter,
     )
     .await;
@@ -433,12 +443,7 @@ impl ProcState {
         .add_package_reqs(npm_package_references)
         .await?;
       self.npm_resolver.cache_packages().await?;
-
-      // add the builtin node modules to the graph data
-      let node_std_graph = self
-        .create_graph(vec![(compat::MODULE_ALL_URL.clone(), ModuleKind::Esm)])
-        .await?;
-      self.graph_data.write().add_graph(&node_std_graph, false);
+      self.prepare_node_std_graph().await?;
     }
 
     // type check if necessary
@@ -479,6 +484,15 @@ impl ProcState {
       g.write()?;
     }
 
+    Ok(())
+  }
+
+  /// Add the builtin node modules to the graph data.
+  pub async fn prepare_node_std_graph(&self) -> Result<(), AnyError> {
+    let node_std_graph = self
+      .create_graph(vec![(compat::MODULE_ALL_URL.clone(), ModuleKind::Esm)])
+      .await?;
+    self.graph_data.write().add_graph(&node_std_graph, false);
     Ok(())
   }
 
@@ -586,17 +600,28 @@ impl ProcState {
     let graph_data = self.graph_data.read();
     for (specifier, entry) in graph_data.entries() {
       if let ModuleEntry::Module {
-        maybe_parsed_source: Some(parsed_source),
-        ..
+        code, media_type, ..
       } = entry
       {
-        emit_parsed_source(
-          &self.emit_cache,
-          specifier,
-          parsed_source,
-          &self.emit_options,
-          self.emit_options_hash,
-        )?;
+        let is_emittable = matches!(
+          media_type,
+          MediaType::TypeScript
+            | MediaType::Mts
+            | MediaType::Cts
+            | MediaType::Jsx
+            | MediaType::Tsx
+        );
+        if is_emittable {
+          emit_parsed_source(
+            &self.emit_cache,
+            &self.parsed_source_cache,
+            specifier,
+            *media_type,
+            code,
+            &self.emit_options,
+            self.emit_options_hash,
+          )?;
+        }
       }
     }
     Ok(())
@@ -627,6 +652,7 @@ impl ProcState {
         .as_ref()
         .map(|im| im.as_resolver())
     };
+    let analyzer = self.parsed_source_cache.as_analyzer();
 
     let graph = create_graph(
       roots,
@@ -635,7 +661,7 @@ impl ProcState {
       &mut cache,
       maybe_resolver,
       maybe_locker,
-      None,
+      Some(&*analyzer),
       None,
     )
     .await;
