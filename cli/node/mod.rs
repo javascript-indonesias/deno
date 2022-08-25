@@ -16,7 +16,6 @@ use deno_core::serde_json::Value;
 use deno_core::url::Url;
 use deno_core::JsRuntime;
 use deno_graph::source::ResolveResponse;
-use deno_runtime::deno_node::get_package_scope_config;
 use deno_runtime::deno_node::legacy_main_resolve;
 use deno_runtime::deno_node::package_exports_resolve;
 use deno_runtime::deno_node::package_imports_resolve;
@@ -136,6 +135,13 @@ pub fn node_resolve(
 ) -> Result<Option<ResolveResponse>, AnyError> {
   // TODO(bartlomieju): skipped "policy" part as we don't plan to support it
 
+  // NOTE(bartlomieju): this will force `ProcState` to use Node.js polyfill for
+  // `module` from `ext/node/`.
+  if specifier == "module" {
+    return Ok(Some(ResolveResponse::Esm(
+      Url::parse("node:module").unwrap(),
+    )));
+  }
   if let Some(resolved) = compat::try_resolve_builtin_module(specifier) {
     return Ok(Some(ResolveResponse::Esm(resolved)));
   }
@@ -150,6 +156,15 @@ pub fn node_resolve(
     if protocol == "node" {
       let split_specifier = url.as_str().split(':');
       let specifier = split_specifier.skip(1).collect::<String>();
+
+      // NOTE(bartlomieju): this will force `ProcState` to use Node.js polyfill for
+      // `module` from `ext/node/`.
+      if specifier == "module" {
+        return Ok(Some(ResolveResponse::Esm(
+          Url::parse("node:module").unwrap(),
+        )));
+      }
+
       if let Some(resolved) = compat::try_resolve_builtin_module(&specifier) {
         return Ok(Some(ResolveResponse::Esm(resolved)));
       } else {
@@ -189,7 +204,11 @@ pub fn node_resolve_npm_reference(
     .resolve_package_from_deno_module(&reference.req)?
     .folder_path;
   let maybe_url = package_config_resolve(
-    reference.sub_path.as_deref().unwrap_or("."),
+    &reference
+      .sub_path
+      .as_ref()
+      .map(|s| format!("./{}", s))
+      .unwrap_or_else(|| ".".to_string()),
     &package_folder,
     npm_resolver,
   )
@@ -329,7 +348,7 @@ fn url_to_resolve_response(
   Ok(if url.as_str().starts_with("http") {
     ResolveResponse::Esm(url)
   } else if url.as_str().ends_with(".js") {
-    let package_config = get_package_scope_config(&url, npm_resolver)?;
+    let package_config = get_closest_package_json(&url, npm_resolver)?;
     if package_config.typ == "module" {
       ResolveResponse::Esm(url)
     } else {
@@ -340,6 +359,37 @@ fn url_to_resolve_response(
   } else {
     ResolveResponse::Esm(url)
   })
+}
+
+fn get_closest_package_json(
+  url: &ModuleSpecifier,
+  npm_resolver: &dyn DenoDirNpmResolver,
+) -> Result<PackageJson, AnyError> {
+  let package_json_path = get_closest_package_json_path(url, npm_resolver)?;
+  PackageJson::load(npm_resolver, package_json_path)
+}
+
+fn get_closest_package_json_path(
+  url: &ModuleSpecifier,
+  npm_resolver: &dyn DenoDirNpmResolver,
+) -> Result<PathBuf, AnyError> {
+  let file_path = url.to_file_path().unwrap();
+  let mut current_dir = file_path.parent().unwrap();
+  let package_json_path = current_dir.join("package.json");
+  if package_json_path.exists() {
+    return Ok(package_json_path);
+  }
+  let root_folder = npm_resolver
+    .resolve_package_folder_from_path(&url.to_file_path().unwrap())?;
+  while current_dir.starts_with(&root_folder) {
+    current_dir = current_dir.parent().unwrap();
+    let package_json_path = current_dir.join("./package.json");
+    if package_json_path.exists() {
+      return Ok(package_json_path);
+    }
+  }
+
+  bail!("did not find package.json in {}", root_folder.display())
 }
 
 fn finalize_resolution(
@@ -434,19 +484,33 @@ fn module_resolve(
   })
 }
 
-fn add_export(source: &mut Vec<String>, name: &str, initializer: &str) {
+fn add_export(
+  source: &mut Vec<String>,
+  name: &str,
+  initializer: &str,
+  temp_var_count: &mut usize,
+) {
+  fn is_valid_var_decl(name: &str) -> bool {
+    // it's ok to be super strict here
+    name
+      .chars()
+      .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '$')
+  }
+
   // TODO(bartlomieju): Node actually checks if a given export exists in `exports` object,
   // but it might not be necessary here since our analysis is more detailed?
-  if RESERVED_WORDS.contains(name) {
-    // we can't create an identifier with a reserved word, so assign it to a temporary
-    // variable that won't have a conflict, then re-export it as a string
+  if RESERVED_WORDS.contains(name) || !is_valid_var_decl(name) {
+    *temp_var_count += 1;
+    // we can't create an identifier with a reserved word or invalid identifier name,
+    // so assign it to a temporary variable that won't have a conflict, then re-export
+    // it as a string
     source.push(format!(
-      "const __deno_reexport_temp__{} = {};",
-      name, initializer
+      "const __deno_export_{}__ = {};",
+      temp_var_count, initializer
     ));
     source.push(format!(
-      "export {{ __deno_reexport_temp__{0} as \"{0}\" }};",
-      name
+      "export {{ __deno_export_{}__ as \"{}\" }};",
+      temp_var_count, name
     ));
   } else {
     source.push(format!("export const {} = {};", name, initializer));
@@ -475,6 +539,7 @@ pub fn translate_cjs_to_esm(
     maybe_syntax: None,
   })?;
   let analysis = parsed_source.analyze_cjs();
+  let mut temp_var_count = 0;
 
   let mut source = vec![
     r#"const require = Deno[Deno.internal].require.Module.createRequire(import.meta.url);"#.to_string(),
@@ -515,7 +580,12 @@ pub fn translate_cjs_to_esm(
 
       for export in analysis.exports.iter().filter(|e| e.as_str() != "default")
       {
-        add_export(&mut source, export, &format!("Deno[Deno.internal].require.bindExport(reexport{0}.{1}, reexport{0})", idx, export));
+        add_export(
+          &mut source,
+          export,
+          &format!("Deno[Deno.internal].require.bindExport(reexport{0}[\"{1}\"], reexport{0})", idx, export),
+          &mut temp_var_count,
+        );
       }
     }
   }
@@ -537,7 +607,7 @@ pub fn translate_cjs_to_esm(
     if export.as_str() == "default" {
       // todo(dsherret): we should only do this if there was a `_esModule: true` instead
       source.push(format!(
-        "export default Deno[Deno.internal].require.bindExport(mod.{}, mod);",
+        "export default Deno[Deno.internal].require.bindExport(mod[\"{}\"], mod);",
         export,
       ));
       had_default = true;
@@ -546,9 +616,10 @@ pub fn translate_cjs_to_esm(
         &mut source,
         export,
         &format!(
-          "Deno[Deno.internal].require.bindExport(mod.{}, mod)",
+          "Deno[Deno.internal].require.bindExport(mod[\"{}\"], mod)",
           export
         ),
+        &mut temp_var_count,
       );
     }
   }
@@ -806,19 +877,22 @@ mod tests {
 
   #[test]
   fn test_add_export() {
+    let mut temp_var_count = 0;
     let mut source = vec![];
 
-    let exports = vec!["static", "server", "app"];
+    let exports = vec!["static", "server", "app", "dashed-export"];
     for export in exports {
-      add_export(&mut source, export, "init");
+      add_export(&mut source, export, "init", &mut temp_var_count);
     }
     assert_eq!(
       source,
       vec![
-        "const __deno_reexport_temp__static = init;".to_string(),
-        "export { __deno_reexport_temp__static as \"static\" };".to_string(),
+        "const __deno_export_1__ = init;".to_string(),
+        "export { __deno_export_1__ as \"static\" };".to_string(),
         "export const server = init;".to_string(),
         "export const app = init;".to_string(),
+        "const __deno_export_2__ = init;".to_string(),
+        "export { __deno_export_2__ as \"dashed-export\" };".to_string(),
       ]
     )
   }

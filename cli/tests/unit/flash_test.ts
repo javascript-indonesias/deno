@@ -34,16 +34,27 @@ function onListen<T>(
   };
 }
 
-Deno.test(async function httpServerInvalidHostname() {
-  await assertRejects(
-    () =>
-      Deno.serve({
-        handler: (_req) => new Response("ok"),
-        hostname: "localhost",
-      }),
-    TypeError,
-    "hostname could not be parsed as an IP address",
-  );
+Deno.test(async function httpServerCanResolveHostnames() {
+  const ac = new AbortController();
+  const listeningPromise = deferred();
+
+  const server = Deno.serve({
+    handler: (_req) => new Response("ok"),
+    hostname: "localhost",
+    port: 4501,
+    signal: ac.signal,
+    onListen: onListen(listeningPromise),
+    onError: createOnErrorCb(ac),
+  });
+
+  await listeningPromise;
+  const resp = await fetch("http://localhost:4501/", {
+    headers: { "connection": "close" },
+  });
+  const text = await resp.text();
+  assertEquals(text, "ok");
+  ac.abort();
+  await server;
 });
 
 Deno.test({ permissions: { net: true } }, async function httpServerBasic() {
@@ -1002,14 +1013,14 @@ Deno.test(
   },
 );
 
-Deno.test("upgradeHttp tcp", async () => {
+Deno.test("upgradeHttpRaw tcp", async () => {
   const promise = deferred();
   const listeningPromise = deferred();
   const promise2 = deferred();
   const ac = new AbortController();
   const signal = ac.signal;
   const handler = async (req: Request) => {
-    const [conn, _] = await Deno.upgradeHttp(req);
+    const [conn, _] = Deno.upgradeHttpRaw(req);
 
     await conn.write(
       new TextEncoder().encode("HTTP/1.1 101 Switching Protocols\r\n\r\n"),
@@ -1028,6 +1039,8 @@ Deno.test("upgradeHttp tcp", async () => {
     conn.close();
   };
   const server = Deno.serve({
+    // NOTE: `as any` is used to bypass type checking for the return value
+    // of the handler.
     handler: handler as any,
     port: 4501,
     signal,
@@ -1831,6 +1844,7 @@ Deno.test(
     const msg = decoder.decode(buf.subarray(0, readResult));
 
     assert(msg.startsWith("HTTP/1.1 304 Not Modified"));
+    assert(msg.endsWith("\r\n\r\n"));
 
     conn.close();
 

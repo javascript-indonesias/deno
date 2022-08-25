@@ -10,7 +10,7 @@ use util::http_server;
 // by setting the DENO_TEST_UTIL_UPDATE_NPM=1 environment variable.
 
 itest!(esm_module {
-  args: "run --allow-read npm/esm/main.js",
+  args: "run --allow-read --unstable npm/esm/main.js",
   output: "npm/esm/main.out",
   envs: env_vars(),
   http_server: true,
@@ -19,6 +19,7 @@ itest!(esm_module {
 itest!(esm_module_eval {
   args_vec: vec![
     "eval",
+    "--unstable",
     "import chalk from 'npm:chalk@5'; console.log(chalk.green('chalk esm loads'));",
   ],
   output: "npm/esm/main.out",
@@ -27,7 +28,7 @@ itest!(esm_module_eval {
 });
 
 itest!(esm_module_deno_test {
-  args: "test --allow-read npm/esm/test.js",
+  args: "test --allow-read --unstable npm/esm/test.js",
   output: "npm/esm/test.out",
   envs: env_vars(),
   http_server: true,
@@ -61,9 +62,23 @@ itest!(cached_only {
   exit_code: 1,
 });
 
+itest!(no_unstable {
+  args: "run npm/no_unstable/main.ts",
+  output: "npm/no_unstable/main.out",
+  envs: env_vars(),
+  exit_code: 1,
+});
+
 itest!(import_map {
   args: "run --allow-read --unstable --import-map npm/import_map/import_map.json npm/import_map/main.js",
   output: "npm/import_map/main.out",
+  envs: env_vars(),
+  http_server: true,
+});
+
+itest!(sub_paths {
+  args: "run --unstable -A --quiet npm/sub_paths/main.jsx",
+  output: "npm/sub_paths/main.out",
   envs: env_vars(),
   http_server: true,
 });
