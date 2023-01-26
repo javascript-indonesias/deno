@@ -164,10 +164,28 @@ itest!(_033_import_map {
   output: "run/033_import_map.out",
 });
 
+itest!(_033_import_map_in_config_file {
+  args: "run --reload --config=import_maps/config.json import_maps/test.ts",
+  output: "run/033_import_map_in_config_file.out",
+});
+
+itest!(_033_import_map_in_flag_has_precedence {
+  args: "run --quiet --reload --import-map=import_maps/import_map_invalid.json --config=import_maps/config.json import_maps/test.ts",
+  output: "run/033_import_map_in_flag_has_precedence.out",
+  exit_code: 1,
+});
+
 itest!(_033_import_map_remote {
   args:
     "run --quiet --reload --import-map=http://127.0.0.1:4545/import_maps/import_map_remote.json --unstable import_maps/test_remote.ts",
   output: "run/033_import_map_remote.out",
+  http_server: true,
+});
+
+itest!(_033_import_map_data_uri {
+  args:
+    "run --quiet --reload --import-map=data:application/json;charset=utf-8;base64,ewogICJpbXBvcnRzIjogewogICAgInRlc3Rfc2VydmVyLyI6ICJodHRwOi8vbG9jYWxob3N0OjQ1NDUvIgogIH0KfQ== run/import_maps/test_data.ts",
+  output: "run/import_maps/test_data.ts.out",
   http_server: true,
 });
 
@@ -202,7 +220,7 @@ itest!(_044_bad_resource {
   exit_code: 1,
 });
 
-// TODO(bartlomieju): remove --unstable once Deno.spawn is stabilized
+// TODO(bartlomieju): remove --unstable once Deno.Command is stabilized
 itest!(_045_proxy {
   args: "run -L debug --unstable --allow-net --allow-env --allow-run --allow-read --reload --quiet run/045_proxy_test.ts",
   output: "run/045_proxy_test.ts.out",
@@ -537,7 +555,7 @@ itest!(_088_dynamic_import_already_evaluating {
   output: "run/088_dynamic_import_already_evaluating.ts.out",
 });
 
-// TODO(bartlomieju): remove --unstable once Deno.spawn is stabilized
+// TODO(bartlomieju): remove --unstable once Deno.Command is stabilized
 itest!(_089_run_allow_list {
   args: "run --unstable --allow-run=curl run/089_run_allow_list.ts",
   output: "run/089_run_allow_list.ts.out",
@@ -625,7 +643,7 @@ itest!(private_field_presence_no_check {
   output: "run/private_field_presence.ts.out",
 });
 
-// TODO(bartlomieju): remove --unstable once Deno.spawn is stabilized
+// TODO(bartlomieju): remove --unstable once Deno.Command is stabilized
 itest!(lock_write_fetch {
   args:
     "run --quiet --allow-read --allow-write --allow-env --allow-run --unstable run/lock_write_fetch/main.ts",
@@ -1151,6 +1169,12 @@ itest!(unbuffered_stdout {
 
 itest!(v8_flags_run {
   args: "run --v8-flags=--expose-gc run/v8_flags.js",
+  output: "run/v8_flags.js.out",
+});
+
+itest!(v8_flags_env_run {
+  envs: vec![("DENO_V8_FLAGS".to_string(), "--expose-gc".to_string())],
+  args: "run run/v8_flags.js",
   output: "run/v8_flags.js.out",
 });
 
@@ -1910,7 +1934,7 @@ fn dont_cache_on_check_fail() {
 mod permissions {
   use test_util as util;
 
-  // TODO(bartlomieju): remove --unstable once Deno.spawn is stabilized
+  // TODO(bartlomieju): remove --unstable once Deno.Command is stabilized
   #[test]
   fn with_allow() {
     for permission in &util::PERMISSION_VARIANTS {
@@ -1929,7 +1953,7 @@ mod permissions {
     }
   }
 
-  // TODO(bartlomieju): remove --unstable once Deno.spawn is stabilized
+  // TODO(bartlomieju): remove --unstable once Deno.Command is stabilized
   #[test]
   fn without_allow() {
     for permission in &util::PERMISSION_VARIANTS {

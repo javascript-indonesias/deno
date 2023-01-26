@@ -373,13 +373,6 @@ pub enum ProseWrap {
   Preserve,
 }
 
-#[derive(Clone, Copy, Debug, Serialize, Deserialize)]
-#[serde(deny_unknown_fields, rename_all = "camelCase")]
-pub enum SemiColons {
-  Prefer,
-  Asi,
-}
-
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
 #[serde(default, deny_unknown_fields, rename_all = "camelCase")]
 pub struct FmtOptionsConfig {
@@ -388,7 +381,7 @@ pub struct FmtOptionsConfig {
   pub indent_width: Option<u8>,
   pub single_quote: Option<bool>,
   pub prose_wrap: Option<ProseWrap>,
-  pub semi_colons: Option<SemiColons>,
+  pub semi_colons: Option<bool>,
 }
 
 #[derive(Clone, Debug, Default, Deserialize)]
@@ -472,6 +465,8 @@ pub enum LockConfig {
 pub struct ConfigFileJson {
   pub compiler_options: Option<Value>,
   pub import_map: Option<String>,
+  pub imports: Option<Value>,
+  pub scopes: Option<Value>,
   pub lint: Option<Value>,
   pub fmt: Option<Value>,
   pub tasks: Option<Value>,
@@ -672,6 +667,21 @@ impl ConfigFile {
 
   pub fn to_import_map_path(&self) -> Option<String> {
     self.json.import_map.clone()
+  }
+
+  pub fn to_import_map_value(&self) -> Value {
+    let mut value = serde_json::Map::with_capacity(2);
+    if let Some(imports) = &self.json.imports {
+      value.insert("imports".to_string(), imports.clone());
+    }
+    if let Some(scopes) = &self.json.scopes {
+      value.insert("scopes".to_string(), scopes.clone());
+    }
+    value.into()
+  }
+
+  pub fn is_an_import_map(&self) -> bool {
+    self.json.imports.is_some() || self.json.scopes.is_some()
   }
 
   pub fn to_fmt_config(&self) -> Result<Option<FmtConfig>, AnyError> {

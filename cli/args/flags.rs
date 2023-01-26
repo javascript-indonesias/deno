@@ -131,7 +131,7 @@ pub struct FmtFlags {
   pub indent_width: Option<NonZeroU8>,
   pub single_quote: Option<bool>,
   pub prose_wrap: Option<String>,
-  pub semi_colons: Option<String>,
+  pub no_semicolons: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -545,6 +545,7 @@ static ENV_VARIABLES_HELP: &str = r#"ENVIRONMENT VARIABLES:
                          (alternative to passing --no-prompt on invocation)
     DENO_NO_UPDATE_CHECK Set to disable checking if a newer Deno version is
                          available
+    DENO_V8_FLAGS        Set V8 command line options
     DENO_WEBGPU_TRACE    Directory to use for wgpu traces
     DENO_JOBS            Number of parallel workers used for the --parallel
                          flag with the test subcommand. Defaults to number
@@ -1177,6 +1178,11 @@ Ignore formatting a file by adding an ignore comment at the top of the file:
     .arg(
       Arg::new("options-use-tabs")
         .long("options-use-tabs")
+        .takes_value(true)
+        .min_values(0)
+        .max_values(1)
+        .require_equals(true)
+        .possible_values(["true", "false"])
         .help("Use tabs instead of spaces for indentation. Defaults to false."),
     )
     .arg(
@@ -1206,6 +1212,11 @@ Ignore formatting a file by adding an ignore comment at the top of the file:
     .arg(
       Arg::new("options-single-quote")
         .long("options-single-quote")
+        .min_values(0)
+        .max_values(1)
+        .takes_value(true)
+        .require_equals(true)
+        .possible_values(["true", "false"])
         .help("Use single quotes. Defaults to false."),
     )
     .arg(
@@ -1216,11 +1227,14 @@ Ignore formatting a file by adding an ignore comment at the top of the file:
         .help("Define how prose should be wrapped. Defaults to always."),
     )
     .arg(
-      Arg::new("options-semi")
-        .long("options-semi")
+      Arg::new("options-no-semicolons")
+        .long("options-no-semicolons")
+        .min_values(0)
+        .max_values(1)
         .takes_value(true)
-        .possible_values(["prefer", "asi"])
-        .help("Use semi colons. Defaults to prefer."),
+        .require_equals(true)
+        .possible_values(["true", "false"])
+        .help("Don't use semicolons except where necessary."),
     )
 }
 
@@ -2115,7 +2129,8 @@ fn v8_flags_arg<'a>() -> Arg<'a> {
     .use_value_delimiter(true)
     .require_equals(true)
     .help("Set V8 command line options")
-    .long_help("To see a list of all available flags use --v8-flags=--help.")
+    .long_help("To see a list of all available flags use --v8-flags=--help.\
+    Any flags set with this flag are appended after the DENO_V8_FLAGS environmental variable")
 }
 
 fn seed_arg<'a>() -> Arg<'a> {
@@ -2544,11 +2559,7 @@ fn fmt_parse(flags: &mut Flags, matches: &clap::ArgMatches) {
   };
   let ext = matches.value_of("ext").unwrap().to_string();
 
-  let use_tabs = if matches.is_present("options-use-tabs") {
-    Some(true)
-  } else {
-    None
-  };
+  let use_tabs = optional_bool_parse(matches, "options-use-tabs");
   let line_width = if matches.is_present("options-line-width") {
     Some(
       matches
@@ -2564,22 +2575,18 @@ fn fmt_parse(flags: &mut Flags, matches: &clap::ArgMatches) {
     Some(
       matches
         .value_of("options-indent-width")
-        .unwrap()
+        .unwrap_or("true")
         .parse()
         .unwrap(),
     )
   } else {
     None
   };
-  let single_quote = if matches.is_present("options-single-quote") {
-    Some(true)
-  } else {
-    None
-  };
+  let single_quote = optional_bool_parse(matches, "options-single-quote");
   let prose_wrap = matches
     .value_of("options-prose-wrap")
     .map(ToString::to_string);
-  let semi_colons = matches.value_of("options-semi").map(ToString::to_string);
+  let no_semicolons = optional_bool_parse(matches, "options-no-semicolons");
 
   flags.subcommand = DenoSubcommand::Fmt(FmtFlags {
     check: matches.is_present("check"),
@@ -2590,8 +2597,16 @@ fn fmt_parse(flags: &mut Flags, matches: &clap::ArgMatches) {
     indent_width,
     single_quote,
     prose_wrap,
-    semi_colons,
+    no_semicolons,
   });
+}
+
+fn optional_bool_parse(matches: &ArgMatches, name: &str) -> Option<bool> {
+  if matches.is_present(name) {
+    Some(matches.value_of(name).unwrap_or("true").parse().unwrap())
+  } else {
+    None
+  }
 }
 
 fn init_parse(flags: &mut Flags, matches: &clap::ArgMatches) {
@@ -3608,7 +3623,7 @@ mod tests {
           indent_width: None,
           single_quote: None,
           prose_wrap: None,
-          semi_colons: None,
+          no_semicolons: None,
         }),
         ..Flags::default()
       }
@@ -3630,7 +3645,7 @@ mod tests {
           indent_width: None,
           single_quote: None,
           prose_wrap: None,
-          semi_colons: None,
+          no_semicolons: None,
         }),
         ..Flags::default()
       }
@@ -3652,7 +3667,7 @@ mod tests {
           indent_width: None,
           single_quote: None,
           prose_wrap: None,
-          semi_colons: None,
+          no_semicolons: None,
         }),
         ..Flags::default()
       }
@@ -3674,7 +3689,7 @@ mod tests {
           indent_width: None,
           single_quote: None,
           prose_wrap: None,
-          semi_colons: None,
+          no_semicolons: None,
         }),
         watch: Some(vec![]),
         ..Flags::default()
@@ -3698,7 +3713,7 @@ mod tests {
           indent_width: None,
           single_quote: None,
           prose_wrap: None,
-          semi_colons: None,
+          no_semicolons: None,
         }),
         watch: Some(vec![]),
         no_clear_screen: true,
@@ -3729,7 +3744,7 @@ mod tests {
           indent_width: None,
           single_quote: None,
           prose_wrap: None,
-          semi_colons: None,
+          no_semicolons: None,
         }),
         watch: Some(vec![]),
         ..Flags::default()
@@ -3752,7 +3767,7 @@ mod tests {
           indent_width: None,
           single_quote: None,
           prose_wrap: None,
-          semi_colons: None,
+          no_semicolons: None,
         }),
         config_flag: ConfigFlag::Path("deno.jsonc".to_string()),
         ..Flags::default()
@@ -3782,7 +3797,7 @@ mod tests {
           indent_width: None,
           single_quote: None,
           prose_wrap: None,
-          semi_colons: None,
+          no_semicolons: None,
         }),
         config_flag: ConfigFlag::Path("deno.jsonc".to_string()),
         watch: Some(vec![]),
@@ -3801,8 +3816,7 @@ mod tests {
       "--options-single-quote",
       "--options-prose-wrap",
       "never",
-      "--options-semi",
-      "asi"
+      "--options-no-semicolons",
     ]);
     assert_eq!(
       r.unwrap(),
@@ -3819,7 +3833,36 @@ mod tests {
           indent_width: Some(NonZeroU8::new(4).unwrap()),
           single_quote: Some(true),
           prose_wrap: Some("never".to_string()),
-          semi_colons: Some("asi".to_string()),
+          no_semicolons: Some(true),
+        }),
+        ..Flags::default()
+      }
+    );
+
+    // try providing =false to the booleans
+    let r = flags_from_vec(svec![
+      "deno",
+      "fmt",
+      "--options-use-tabs=false",
+      "--options-single-quote=false",
+      "--options-no-semicolons=false",
+    ]);
+    assert_eq!(
+      r.unwrap(),
+      Flags {
+        subcommand: DenoSubcommand::Fmt(FmtFlags {
+          check: false,
+          ext: "ts".to_string(),
+          files: FileFlags {
+            include: vec![],
+            ignore: vec![],
+          },
+          use_tabs: Some(false),
+          line_width: None,
+          indent_width: None,
+          single_quote: Some(false),
+          prose_wrap: None,
+          no_semicolons: Some(false),
         }),
         ..Flags::default()
       }

@@ -2,10 +2,12 @@
 
 mod config_file;
 mod flags;
+mod flags_allow_net;
+mod import_map;
 mod lockfile;
 
-mod flags_allow_net;
-
+pub use self::import_map::resolve_import_map_from_specifier;
+use ::import_map::ImportMap;
 pub use config_file::BenchConfig;
 pub use config_file::CompilerOptions;
 pub use config_file::ConfigFile;
@@ -15,7 +17,6 @@ pub use config_file::FmtOptionsConfig;
 pub use config_file::JsxImportSourceConfig;
 pub use config_file::LintRulesConfig;
 pub use config_file::ProseWrap;
-pub use config_file::SemiColons;
 pub use config_file::TsConfig;
 pub use config_file::TsConfigForEmit;
 pub use config_file::TsConfigType;
@@ -50,6 +51,7 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use crate::cache::DenoDir;
+use crate::file_fetcher::FileFetcher;
 use crate::util::fs::canonicalize_path_maybe_not_exists;
 use crate::version;
 
@@ -201,13 +203,8 @@ fn resolve_fmt_options(
       });
     }
 
-    if let Some(semi_colons) = &fmt_flags.semi_colons {
-      options.semi_colons = Some(match semi_colons.as_str() {
-        "prefer" => SemiColons::Prefer,
-        "asi" => SemiColons::Asi,
-        // validators in `flags.rs` makes other values unreachable
-        _ => unreachable!(),
-      });
+    if let Some(no_semis) = &fmt_flags.no_semicolons {
+      options.semi_colons = Some(!no_semis);
     }
   }
 
@@ -553,17 +550,39 @@ impl CliOptions {
   }
 
   /// Based on an optional command line import map path and an optional
-  /// configuration file, return a resolved module specifier to an import map.
+  /// configuration file, return a resolved module specifier to an import map
+  /// and a boolean indicating if unknown keys should not result in diagnostics.
   pub fn resolve_import_map_specifier(
     &self,
   ) -> Result<Option<ModuleSpecifier>, AnyError> {
     match self.overrides.import_map_specifier.clone() {
-      Some(path) => Ok(path),
+      Some(maybe_path) => Ok(maybe_path),
       None => resolve_import_map_specifier(
         self.flags.import_map_path.as_deref(),
         self.maybe_config_file.as_ref(),
       ),
     }
+  }
+
+  pub async fn resolve_import_map(
+    &self,
+    file_fetcher: &FileFetcher,
+  ) -> Result<Option<ImportMap>, AnyError> {
+    let import_map_specifier = match self.resolve_import_map_specifier()? {
+      Some(specifier) => specifier,
+      None => return Ok(None),
+    };
+    resolve_import_map_from_specifier(
+      &import_map_specifier,
+      self.get_maybe_config_file().as_ref(),
+      file_fetcher,
+    )
+    .await
+    .context(format!(
+      "Unable to load '{}' import map",
+      import_map_specifier
+    ))
+    .map(Some)
   }
 
   /// Overrides the import map specifier to use.
@@ -913,6 +932,16 @@ fn resolve_import_map_specifier(
       .context(format!("Bad URL (\"{}\") for import map.", import_map_path))?;
     return Ok(Some(specifier));
   } else if let Some(config_file) = &maybe_config_file {
+    // if the config file is an import map we prefer to use it, over `importMap`
+    // field
+    if config_file.is_an_import_map() {
+      if let Some(_import_map_path) = config_file.to_import_map_path() {
+        log::warn!("{} \"importMap\" setting is ignored when \"imports\" or \"scopes\" are specified in the config file.", colors::yellow("Warning"));
+      }
+
+      return Ok(Some(config_file.specifier.clone()));
+    }
+
     // when the import map is specifier in a config file, it needs to be
     // resolved relative to the config file, versus the CWD like with the flag
     // and with config files, we support both local and remote config files,
@@ -996,7 +1025,7 @@ mod test {
     let actual = actual.unwrap();
     assert_eq!(
       actual,
-      Some(ModuleSpecifier::parse("file:///deno/import_map.json").unwrap())
+      Some(ModuleSpecifier::parse("file:///deno/import_map.json").unwrap(),)
     );
   }
 
@@ -1055,6 +1084,21 @@ mod test {
     assert!(actual.is_ok());
     let actual = actual.unwrap();
     assert_eq!(actual, Some(expected_specifier));
+  }
+
+  #[test]
+  fn resolve_import_map_embedded_take_precedence() {
+    let config_text = r#"{
+      "importMap": "import_map.json",
+      "imports": {},
+    }"#;
+    let config_specifier =
+      ModuleSpecifier::parse("file:///deno/deno.jsonc").unwrap();
+    let config_file = ConfigFile::new(config_text, &config_specifier).unwrap();
+    let actual = resolve_import_map_specifier(None, Some(&config_file));
+    assert!(actual.is_ok());
+    let actual = actual.unwrap();
+    assert_eq!(actual, Some(config_specifier));
   }
 
   #[test]
