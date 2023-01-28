@@ -103,7 +103,7 @@ pub fn ensure_directory_specifier(
 ) -> ModuleSpecifier {
   let path = specifier.path();
   if !path.ends_with('/') {
-    let new_path = format!("{}/", path);
+    let new_path = format!("{path}/");
     specifier.set_path(&new_path);
   }
   specifier
@@ -4563,7 +4563,7 @@ fn lsp_completions_node_specifier() {
     .filter(|d| {
       d.code
         == Some(lsp::NumberOrString::String(
-          "import-prefix-missing".to_string(),
+          "import-node-prefix-missing".to_string(),
         ))
     })
     .collect::<Vec<_>>();
@@ -4602,7 +4602,7 @@ fn lsp_completions_node_specifier() {
             "end": { "line": 0, "character": 19 }
           },
           "severity": 1,
-          "code": "import-prefix-missing",
+          "code": "import-node-prefix-missing",
           "source": "deno",
           "message": "Relative import path \"fs\" not prefixed with / or ./ or ../\nIf you want to use a built-in Node module, add a \"node:\" prefix (ex. \"node:fs\").",
           "data": {
