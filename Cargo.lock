@@ -851,7 +851,6 @@ dependencies = [
  "ring",
  "rustyline",
  "rustyline-derive",
- "semver 1.0.14",
  "serde",
  "serde_json",
  "serde_repr",
@@ -1092,19 +1091,21 @@ dependencies = [
 
 [[package]]
 name = "deno_graph"
-version = "0.43.0"
+version = "0.43.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "f71bb48b14950d62552aee1d05d0b90c203319b293b36358021ec77e05eaf9a4"
+checksum = "2c8c63d016d4bbc7fcd0cecfb3903b92591ace5ba61229e2c5cf61337b21d165"
 dependencies = [
  "anyhow",
  "data-url",
  "deno_ast",
  "futures",
+ "monch",
  "once_cell",
  "parking_lot 0.12.1",
  "regex",
  "serde",
  "serde_json",
+ "thiserror",
  "url",
 ]
 
