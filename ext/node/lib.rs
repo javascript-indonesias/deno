@@ -20,6 +20,8 @@ mod package_json;
 mod path;
 mod polyfill;
 mod resolution;
+mod v8;
+mod winerror;
 
 pub use package_json::PackageJson;
 pub use path::PathClean;
@@ -229,7 +231,6 @@ pub fn init_polyfill() -> Extension {
     "internal_binding/_node.ts",
     "internal_binding/_timingSafeEqual.ts",
     "internal_binding/_utils.ts",
-    "internal_binding/_winerror.ts",
     "internal_binding/ares.ts",
     "internal_binding/async_wrap.ts",
     "internal_binding/buffer.ts",
@@ -386,7 +387,6 @@ pub fn init_polyfill() -> Extension {
     "stream/consumers.mjs",
     "stream/promises.mjs",
     "stream/web.ts",
-    "string_decoder_bench.js",
     "string_decoder.ts",
     "sys.ts",
     "timers.ts",
@@ -412,6 +412,9 @@ pub fn init_polyfill() -> Extension {
       crypto::op_node_hash_update::decl(),
       crypto::op_node_hash_digest::decl(),
       crypto::op_node_hash_clone::decl(),
+      winerror::op_node_sys_to_uv_error::decl(),
+      v8::op_v8_cached_data_version_tag::decl(),
+      v8::op_v8_get_heap_statistics::decl(),
       op_node_build_os::decl(),
     ])
     .build()
