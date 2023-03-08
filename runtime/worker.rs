@@ -206,7 +206,6 @@ impl MainWorker {
         state.put::<PermissionsContainer>(permissions.clone());
         state.put(ops::UnstableChecker { unstable });
         state.put(ops::TestingFeaturesEnabled(enable_testing_features));
-        Ok(())
       })
       .build();
     let exit_code = ExitCode(Arc::new(AtomicI32::new(0)));
@@ -255,7 +254,7 @@ impl MainWorker {
         options.format_js_error_fn.clone(),
       ),
       ops::fs_events::init(),
-      ops::fs::init::<PermissionsContainer>(),
+      deno_fs::init::<PermissionsContainer>(unstable),
       deno_io::init(options.stdio),
       deno_tls::init(),
       deno_net::init::<PermissionsContainer>(

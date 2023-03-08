@@ -383,6 +383,22 @@ function promiseRejectMacrotaskCallback() {
 }
 
 let hasBootstrapped = false;
+// Set up global properties shared by main and worker runtime.
+ObjectDefineProperties(globalThis, windowOrWorkerGlobalScope);
+// FIXME(bartlomieju): temporarily add whole `Deno.core` to
+// `Deno[Deno.internal]` namespace. It should be removed and only necessary
+// methods should be left there.
+ObjectAssign(internals, {
+  core,
+});
+const internalSymbol = Symbol("Deno.internal");
+const finalDenoNs = {
+  internal: internalSymbol,
+  [internalSymbol]: internals,
+  resources: core.resources,
+  close: core.close,
+  ...denoNs,
+};
 
 function bootstrapMainRuntime(runtimeOptions) {
   if (hasBootstrapped) {
@@ -392,12 +408,9 @@ function bootstrapMainRuntime(runtimeOptions) {
   performance.setTimeOrigin(DateNow());
   globalThis_ = globalThis;
 
-  const consoleFromV8 = globalThis.Deno.core.console;
-
   // Remove bootstrapping data from the global scope
   delete globalThis.__bootstrap;
   delete globalThis.bootstrap;
-  util.log("bootstrapMainRuntime");
   hasBootstrapped = true;
 
   // If the `--location` flag isn't set, make `globalThis.location` `undefined` and
@@ -411,7 +424,6 @@ function bootstrapMainRuntime(runtimeOptions) {
     location.setLocationHref(runtimeOptions.location);
   }
 
-  ObjectDefineProperties(globalThis, windowOrWorkerGlobalScope);
   if (runtimeOptions.unstableFlag) {
     ObjectDefineProperties(globalThis, unstableWindowOrWorkerGlobalScope);
   }
@@ -423,6 +435,7 @@ function bootstrapMainRuntime(runtimeOptions) {
   ObjectSetPrototypeOf(globalThis, Window.prototype);
 
   if (runtimeOptions.inspectFlag) {
+    const consoleFromV8 = core.console;
     const consoleFromDeno = globalThis.console;
     wrapConsole(consoleFromDeno, consoleFromV8);
   }
@@ -453,8 +466,6 @@ function bootstrapMainRuntime(runtimeOptions) {
   setUserAgent(runtimeOptions.userAgent);
   setLanguage(runtimeOptions.locale);
 
-  const internalSymbol = Symbol("Deno.internal");
-
   // These have to initialized here and not in `90_deno_ns.js` because
   // the op function that needs to be passed will be invalidated by creating
   // a snapshot
@@ -476,13 +487,6 @@ function bootstrapMainRuntime(runtimeOptions) {
     core,
   });
 
-  const finalDenoNs = {
-    internal: internalSymbol,
-    [internalSymbol]: internals,
-    resources: core.resources,
-    close: core.close,
-    ...denoNs,
-  };
   ObjectDefineProperties(finalDenoNs, {
     pid: util.readOnly(runtimeOptions.pid),
     ppid: util.readOnly(runtimeOptions.ppid),
@@ -529,9 +533,8 @@ function bootstrapWorkerRuntime(
   // Remove bootstrapping data from the global scope
   delete globalThis.__bootstrap;
   delete globalThis.bootstrap;
-  util.log("bootstrapWorkerRuntime");
   hasBootstrapped = true;
-  ObjectDefineProperties(globalThis, windowOrWorkerGlobalScope);
+
   if (runtimeOptions.unstableFlag) {
     ObjectDefineProperties(globalThis, unstableWindowOrWorkerGlobalScope);
   }
@@ -581,8 +584,6 @@ function bootstrapWorkerRuntime(
 
   globalThis.pollForMessages = pollForMessages;
 
-  const internalSymbol = Symbol("Deno.internal");
-
   // These have to initialized here and not in `90_deno_ns.js` because
   // the op function that needs to be passed will be invalidated by creating
   // a snapshot
@@ -604,13 +605,6 @@ function bootstrapWorkerRuntime(
     core,
   });
 
-  const finalDenoNs = {
-    internal: internalSymbol,
-    [internalSymbol]: internals,
-    resources: core.resources,
-    close: core.close,
-    ...denoNs,
-  };
   if (runtimeOptions.unstableFlag) {
     ObjectAssign(finalDenoNs, denoNsUnstable);
     // These have to initialized here and not in `90_deno_ns.js` because
@@ -634,12 +628,7 @@ function bootstrapWorkerRuntime(
   ObjectDefineProperty(globalThis, "Deno", util.readOnly(finalDenoNs));
 }
 
-ObjectDefineProperties(globalThis, {
-  bootstrap: {
-    value: {
-      mainRuntime: bootstrapMainRuntime,
-      workerRuntime: bootstrapWorkerRuntime,
-    },
-    configurable: true,
-  },
-});
+globalThis.bootstrap = {
+  mainRuntime: bootstrapMainRuntime,
+  workerRuntime: bootstrapWorkerRuntime,
+};

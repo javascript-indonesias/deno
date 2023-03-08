@@ -376,7 +376,6 @@ impl WebWorker {
         state.put::<PermissionsContainer>(permissions.clone());
         state.put(ops::UnstableChecker { unstable });
         state.put(ops::TestingFeaturesEnabled(enable_testing_features));
-        Ok(())
       })
       .build();
     let create_cache = options.cache_storage_dir.map(|storage_dir| {
@@ -425,7 +424,7 @@ impl WebWorker {
       ),
       // Extensions providing Deno.* features
       ops::fs_events::init(),
-      ops::fs::init::<PermissionsContainer>(),
+      deno_fs::init::<PermissionsContainer>(unstable),
       deno_io::init(options.stdio),
       deno_tls::init(),
       deno_net::init::<PermissionsContainer>(
