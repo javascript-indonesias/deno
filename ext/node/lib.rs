@@ -1,11 +1,18 @@
 // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
+use std::collections::HashSet;
+use std::path::Path;
+use std::path::PathBuf;
+use std::rc::Rc;
+
 use deno_core::error::AnyError;
 use deno_core::located_script_name;
 use deno_core::op;
 use deno_core::serde_json;
 use deno_core::JsRuntime;
 use deno_core::ModuleSpecifier;
+use deno_fs::sync::MaybeSend;
+use deno_fs::sync::MaybeSync;
 use deno_npm::resolution::PackageReqNotFoundError;
 use deno_npm::NpmPackageId;
 use deno_semver::npm::NpmPackageNv;
@@ -13,12 +20,6 @@ use deno_semver::npm::NpmPackageNvReference;
 use deno_semver::npm::NpmPackageReq;
 use deno_semver::npm::NpmPackageReqReference;
 use once_cell::sync::Lazy;
-use std::collections::HashSet;
-use std::io;
-use std::path::Path;
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
 
 pub mod analyze;
 pub mod errors;
@@ -51,72 +52,10 @@ impl NodePermissions for AllowAllNodePermissions {
   }
 }
 
-#[derive(Default, Clone)]
-pub struct NodeFsMetadata {
-  pub is_file: bool,
-  pub is_dir: bool,
-}
+#[allow(clippy::disallowed_types)]
+pub type NpmResolverRc = deno_fs::sync::MaybeArc<dyn NpmResolver>;
 
-pub trait NodeFs: std::fmt::Debug + Send + Sync {
-  fn current_dir(&self) -> io::Result<PathBuf>;
-  fn metadata(&self, path: &Path) -> io::Result<NodeFsMetadata>;
-  fn is_file(&self, path: &Path) -> bool;
-  fn is_dir(&self, path: &Path) -> bool;
-  fn exists(&self, path: &Path) -> bool;
-  fn read_to_string(&self, path: &Path) -> io::Result<String>;
-  fn canonicalize(&self, path: &Path) -> io::Result<PathBuf>;
-}
-
-#[derive(Debug)]
-pub struct RealFs;
-
-impl NodeFs for RealFs {
-  fn current_dir(&self) -> io::Result<PathBuf> {
-    #[allow(clippy::disallowed_methods)]
-    std::env::current_dir()
-  }
-
-  fn metadata(&self, path: &Path) -> io::Result<NodeFsMetadata> {
-    #[allow(clippy::disallowed_methods)]
-    std::fs::metadata(path).map(|metadata| {
-      // on most systems, calling is_file() and is_dir() is cheap
-      // and returns information already found in the metadata object
-      NodeFsMetadata {
-        is_file: metadata.is_file(),
-        is_dir: metadata.is_dir(),
-      }
-    })
-  }
-
-  fn exists(&self, path: &Path) -> bool {
-    #[allow(clippy::disallowed_methods)]
-    std::fs::metadata(path).is_ok()
-  }
-
-  fn is_file(&self, path: &Path) -> bool {
-    #[allow(clippy::disallowed_methods)]
-    std::fs::metadata(path)
-      .map(|m| m.is_file())
-      .unwrap_or(false)
-  }
-
-  fn is_dir(&self, path: &Path) -> bool {
-    #[allow(clippy::disallowed_methods)]
-    std::fs::metadata(path).map(|m| m.is_dir()).unwrap_or(false)
-  }
-
-  fn read_to_string(&self, path: &Path) -> io::Result<String> {
-    #[allow(clippy::disallowed_methods)]
-    std::fs::read_to_string(path)
-  }
-
-  fn canonicalize(&self, path: &Path) -> io::Result<PathBuf> {
-    #[allow(clippy::disallowed_methods)]
-    std::path::Path::canonicalize(path)
-  }
-}
-
-pub trait NpmResolver: std::fmt::Debug + Send + Sync {
+pub trait NpmResolver: std::fmt::Debug + MaybeSend + MaybeSync {
   /// Resolves an npm package folder path from an npm package referrer.
   fn resolve_package_folder_from_package(
     &self,
@@ -515,11 +454,11 @@ deno_core::extension!(deno_node,
     "zlib.ts",
   ],
   options = {
-    maybe_npm_resolver: Option<Arc<dyn NpmResolver>>,
-    fs: Option<Arc<dyn NodeFs>>,
+    maybe_npm_resolver: Option<NpmResolverRc>,
+    fs: deno_fs::FileSystemRc,
   },
   state = |state, options| {
-    let fs = options.fs.unwrap_or_else(|| Arc::new(RealFs));
+    let fs = options.fs;
     state.put(fs.clone());
     if let Some(npm_resolver) = options.maybe_npm_resolver {
       state.put(npm_resolver.clone());
