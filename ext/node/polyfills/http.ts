@@ -641,6 +641,8 @@ class ClientRequest extends OutgoingMessage {
         }
         this._client.close();
         const incoming = new IncomingMessageForClient(this.socket);
+        incoming.req = this;
+        this.res = incoming;
 
         // TODO(@crowlKats):
         // incoming.httpVersionMajor = versionMajor;
@@ -970,6 +972,7 @@ export class IncomingMessageForClient extends NodeReadable {
   // any messages, before ever calling this.  In that case, just skip
   // it, since something else is destroying this connection anyway.
   _destroy(err, cb) {
+    this.complete = true;
     if (!this.readableEnded || !this.complete) {
       this.aborted = true;
       this.emit("aborted");
