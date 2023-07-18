@@ -88,6 +88,35 @@ itest!(cjs_invalid_name_exports {
   http_server: true,
 });
 
+itest!(cjs_require_esm_error {
+  args: "run --allow-read --quiet npm/cjs_require_esm_error/main.ts",
+  output: "npm/cjs_require_esm_error/main.out",
+  envs: env_vars_for_npm_tests(),
+  http_server: true,
+  exit_code: 1,
+});
+
+itest!(cjs_require_esm_mjs_error {
+  args: "run --allow-read --quiet npm/cjs_require_esm_mjs_error/main.ts",
+  output: "npm/cjs_require_esm_mjs_error/main.out",
+  envs: env_vars_for_npm_tests(),
+  http_server: true,
+  exit_code: 1,
+});
+
+itest!(require_esm_error {
+  args: "run --allow-read --quiet node/require_esm_error/main.ts",
+  output: "node/require_esm_error/main.out",
+  exit_code: 1,
+});
+
+itest!(dynamic_import_deno_ts_from_npm {
+  args: "run --allow-read --quiet npm/dynamic_import_deno_ts_from_npm/main.ts",
+  output: "npm/dynamic_import_deno_ts_from_npm/main.out",
+  envs: env_vars_for_npm_tests(),
+  http_server: true,
+});
+
 itest!(translate_cjs_to_esm {
   args: "run -A --quiet npm/translate_cjs_to_esm/main.js",
   output: "npm/translate_cjs_to_esm/main.out",
