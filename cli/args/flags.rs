@@ -219,6 +219,14 @@ pub struct TaskFlags {
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub enum TestReporterConfig {
+  #[default]
+  Pretty,
+  Dot,
+  Junit,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct TestFlags {
   pub doc: bool,
   pub no_run: bool,
@@ -231,6 +239,7 @@ pub struct TestFlags {
   pub concurrent_jobs: Option<NonZeroUsize>,
   pub trace_ops: bool,
   pub watch: Option<WatchFlags>,
+  pub reporter: TestReporterConfig,
   pub junit_path: Option<String>,
 }
 
@@ -1868,14 +1877,17 @@ Directory arguments are expanded to all contained files matching the glob
     .arg(no_clear_screen_arg())
     .arg(script_arg().last(true))
     .arg(
-      Arg::new("junit")
-        .long("junit")
+      Arg::new("junit-path")
+        .long("junit-path")
         .value_name("PATH")
         .value_hint(ValueHint::FilePath)
         .help("Write a JUnit XML test report to PATH. Use '-' to write to stdout which is the default when PATH is not provided.")
-        .num_args(0..=1)
-        .require_equals(true)
-        .default_missing_value("-")
+    )
+    .arg(
+      Arg::new("reporter")
+        .long("reporter")
+        .help("Select reporter to use. Default to 'pretty'.")
+        .value_parser(["pretty", "dot", "junit"])
     )
   )
 }
@@ -3077,7 +3089,23 @@ fn test_parse(flags: &mut Flags, matches: &mut ArgMatches) {
     Vec::new()
   };
 
-  let junit_path = matches.remove_one::<String>("junit");
+  let junit_path = matches.remove_one::<String>("junit-path");
+
+  let reporter =
+    if let Some(reporter) = matches.remove_one::<String>("reporter") {
+      match reporter.as_str() {
+        "pretty" => TestReporterConfig::Pretty,
+        "junit" => TestReporterConfig::Junit,
+        "dot" => TestReporterConfig::Dot,
+        _ => unreachable!(),
+      }
+    } else {
+      TestReporterConfig::Pretty
+    };
+
+  if matches!(reporter, TestReporterConfig::Dot) {
+    flags.log_level = Some(Level::Error);
+  }
 
   flags.subcommand = DenoSubcommand::Test(TestFlags {
     no_run,
@@ -3091,6 +3119,7 @@ fn test_parse(flags: &mut Flags, matches: &mut ArgMatches) {
     concurrent_jobs,
     trace_ops,
     watch: watch_arg_parse(matches),
+    reporter,
     junit_path,
   });
 }
@@ -5995,6 +6024,7 @@ mod tests {
           trace_ops: true,
           coverage_dir: Some("cov".to_string()),
           watch: Default::default(),
+          reporter: Default::default(),
           junit_path: None,
         }),
         unstable: true,
@@ -6061,6 +6091,7 @@ mod tests {
       Flags {
         subcommand: DenoSubcommand::Test(TestFlags {
           no_run: false,
+          reporter: Default::default(),
           doc: false,
           fail_fast: None,
           filter: None,
@@ -6107,6 +6138,7 @@ mod tests {
           trace_ops: false,
           coverage_dir: None,
           watch: Default::default(),
+          reporter: Default::default(),
           junit_path: None,
         }),
         type_check_mode: TypeCheckMode::Local,
@@ -6144,6 +6176,7 @@ mod tests {
           trace_ops: false,
           coverage_dir: None,
           watch: Default::default(),
+          reporter: Default::default(),
           junit_path: None,
         }),
         no_prompt: true,
@@ -6152,6 +6185,76 @@ mod tests {
         ..Flags::default()
       }
     );
+  }
+
+  #[test]
+  fn test_reporter() {
+    let r = flags_from_vec(svec!["deno", "test", "--reporter=pretty"]);
+    assert_eq!(
+      r.unwrap(),
+      Flags {
+        subcommand: DenoSubcommand::Test(TestFlags {
+          reporter: TestReporterConfig::Pretty,
+          ..Default::default()
+        }),
+        no_prompt: true,
+        type_check_mode: TypeCheckMode::Local,
+        ..Flags::default()
+      }
+    );
+
+    let r = flags_from_vec(svec!["deno", "test", "--reporter=dot"]);
+    assert_eq!(
+      r.unwrap(),
+      Flags {
+        subcommand: DenoSubcommand::Test(TestFlags {
+          reporter: TestReporterConfig::Dot,
+          ..Default::default()
+        }),
+        no_prompt: true,
+        type_check_mode: TypeCheckMode::Local,
+        log_level: Some(Level::Error),
+        ..Flags::default()
+      }
+    );
+
+    let r = flags_from_vec(svec!["deno", "test", "--reporter=junit"]);
+    assert_eq!(
+      r.unwrap(),
+      Flags {
+        subcommand: DenoSubcommand::Test(TestFlags {
+          reporter: TestReporterConfig::Junit,
+          ..Default::default()
+        }),
+        no_prompt: true,
+        type_check_mode: TypeCheckMode::Local,
+        ..Flags::default()
+      }
+    );
+
+    let r = flags_from_vec(svec![
+      "deno",
+      "test",
+      "--reporter=dot",
+      "--junit-path=report.xml"
+    ]);
+    assert_eq!(
+      r.unwrap(),
+      Flags {
+        subcommand: DenoSubcommand::Test(TestFlags {
+          reporter: TestReporterConfig::Dot,
+          junit_path: Some("report.xml".to_string()),
+          ..Default::default()
+        }),
+        no_prompt: true,
+        type_check_mode: TypeCheckMode::Local,
+        log_level: Some(Level::Error),
+        ..Flags::default()
+      }
+    );
+
+    let r = flags_from_vec(svec!["deno", "test", "--junit-path"]);
+    assert!(r.is_err());
   }
 
   #[test]
@@ -6175,6 +6278,7 @@ mod tests {
           trace_ops: false,
           coverage_dir: None,
           watch: Default::default(),
+          reporter: Default::default(),
           junit_path: None,
         }),
         no_prompt: true,
@@ -6207,6 +6311,7 @@ mod tests {
           watch: Some(WatchFlags {
             no_clear_screen: false,
           }),
+          reporter: Default::default(),
           junit_path: None,
         }),
         no_prompt: true,
@@ -6238,6 +6343,7 @@ mod tests {
           watch: Some(WatchFlags {
             no_clear_screen: false,
           }),
+          reporter: Default::default(),
           junit_path: None,
         }),
         no_prompt: true,
@@ -6271,67 +6377,8 @@ mod tests {
           watch: Some(WatchFlags {
             no_clear_screen: true,
           }),
+          reporter: Default::default(),
           junit_path: None,
-        }),
-        type_check_mode: TypeCheckMode::Local,
-        no_prompt: true,
-        ..Flags::default()
-      }
-    );
-  }
-
-  #[test]
-  fn test_junit_default() {
-    let r = flags_from_vec(svec!["deno", "test", "--junit"]);
-    assert_eq!(
-      r.unwrap(),
-      Flags {
-        subcommand: DenoSubcommand::Test(TestFlags {
-          no_run: false,
-          doc: false,
-          fail_fast: None,
-          filter: None,
-          allow_none: false,
-          shuffle: None,
-          files: FileFlags {
-            include: vec![],
-            ignore: vec![],
-          },
-          concurrent_jobs: None,
-          trace_ops: false,
-          coverage_dir: None,
-          watch: Default::default(),
-          junit_path: Some("-".to_string()),
-        }),
-        type_check_mode: TypeCheckMode::Local,
-        no_prompt: true,
-        ..Flags::default()
-      }
-    );
-  }
-
-  #[test]
-  fn test_junit_with_path() {
-    let r = flags_from_vec(svec!["deno", "test", "--junit=junit.xml"]);
-    assert_eq!(
-      r.unwrap(),
-      Flags {
-        subcommand: DenoSubcommand::Test(TestFlags {
-          no_run: false,
-          doc: false,
-          fail_fast: None,
-          filter: None,
-          allow_none: false,
-          shuffle: None,
-          files: FileFlags {
-            include: vec![],
-            ignore: vec![],
-          },
-          concurrent_jobs: None,
-          trace_ops: false,
-          coverage_dir: None,
-          watch: Default::default(),
-          junit_path: Some("junit.xml".to_string()),
         }),
         type_check_mode: TypeCheckMode::Local,
         no_prompt: true,
