@@ -45,7 +45,7 @@ use deno_runtime::deno_node::PackageJson;
 use deno_runtime::permissions::PermissionsContainer;
 use deno_semver::npm::NpmPackageReqReference;
 use deno_semver::package::PackageReq;
-use indexmap::IndexMap;
+use indexmap1::IndexMap;
 use lsp::Url;
 use once_cell::sync::Lazy;
 use package_json::PackageJsonDepsProvider;
@@ -1262,13 +1262,10 @@ impl Documents {
       {
         imports
           .into_iter()
-          .map(|import| {
-            let graph_import = GraphImport::new(
-              &import.referrer,
-              import.imports,
-              Some(self.get_resolver()),
-            );
-            (import.referrer, graph_import)
+          .map(|(referrer, imports)| {
+            let graph_import =
+              GraphImport::new(&referrer, imports, Some(self.get_resolver()));
+            (referrer, graph_import)
           })
           .collect()
       } else {
