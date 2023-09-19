@@ -408,25 +408,84 @@ impl JupyterServer {
       tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     } else {
       let exception_details = exception_details.unwrap();
-      let name = if let Some(exception) = exception_details.exception {
-        if let Some(description) = exception.description {
-          description
-        } else if let Some(value) = exception.value {
-          value.to_string()
+
+      // Determine the exception value and name
+      let (name, message, stack) =
+        if let Some(exception) = exception_details.exception {
+          let result = self
+            .repl_session
+            .call_function_on_args(
+              r#"
+          function(object) {
+            if (object instanceof Error) {
+              const name = "name" in object ? String(object.name) : "";
+              const message = "message" in object ? String(object.message) : "";
+              const stack = "stack" in object ? String(object.stack) : "";
+              return JSON.stringify({ name, message, stack });
+            } else {
+              const message = String(object);
+              return JSON.stringify({ name: "", message, stack: "" });
+            }
+          }
+        "#
+              .into(),
+              &[exception],
+            )
+            .await?;
+
+          match result.result.value {
+            Some(serde_json::Value::String(str)) => {
+              if let Ok(object) =
+                serde_json::from_str::<HashMap<String, String>>(&str)
+              {
+                let get = |k| object.get(k).cloned().unwrap_or_default();
+                (get("name"), get("message"), get("stack"))
+              } else {
+                eprintln!("Unexpected result while parsing JSON {str}");
+                ("".into(), "".into(), "".into())
+              }
+            }
+            _ => {
+              eprintln!("Unexpected result while parsing exception {result:?}");
+              ("".into(), "".into(), "".into())
+            }
+          }
         } else {
-          "undefined".to_string()
-        }
+          eprintln!("Unexpectedly missing exception {exception_details:?}");
+          ("".into(), "".into(), "".into())
+        };
+
+      let stack = if stack.is_empty() {
+        format!(
+          "{}\n    at <unknown>",
+          serde_json::to_string(&message).unwrap()
+        )
       } else {
-        "Unknown exception".to_string()
+        stack
+      };
+      let traceback = format!("Stack trace:\n{stack}")
+        .split('\n')
+        .map(|s| s.to_owned())
+        .collect::<Vec<_>>();
+
+      let ename = if name.is_empty() {
+        "Unknown error".into()
+      } else {
+        name
       };
 
-      // TODO(bartlomieju): fill all the fields
+      let evalue = if message.is_empty() {
+        "(none)".into()
+      } else {
+        message
+      };
+
       msg
         .new_message("error")
         .with_content(json!({
-          "ename": name,
-          "evalue": " ", // Fake value, otherwise old Jupyter frontends don't show the error
-          "traceback": [],
+          "ename": ename,
+          "evalue": evalue,
+          "traceback": traceback,
         }))
         .send(&mut *self.iopub_socket.lock().await)
         .await?;
@@ -482,32 +541,49 @@ async fn get_jupyter_display(
 ) -> Result<Option<HashMap<String, serde_json::Value>>, AnyError> {
   let response = session
     .call_function_on_args(
-      r#"function (object) {{
-      return JSON.stringify(object[Symbol.for("Jupyter.display")]());
-    }}"#
+      r#"function (object) {
+        const display = object[Symbol.for("Jupyter.display")];
+        if (typeof display === "function") {
+          return JSON.stringify(display());
+        } else {
+          return null;
+        }
+      }"#
         .to_string(),
       &[evaluate_result.clone()],
     )
     .await?;
 
   if let Some(exception_details) = &response.exception_details {
-    // TODO(rgbkrk): Return an error in userspace instead of Jupyter logs
+    // If the object doesn't have a Jupyter.display method or it throws an
+    // exception, we just ignore it and let the caller handle it.
     eprintln!("Exception encountered: {}", exception_details.text);
     return Ok(None);
   }
 
-  if let Some(serde_json::Value::String(json_str)) = response.result.value {
-    let data: HashMap<String, serde_json::Value> =
-      serde_json::from_str(&json_str)?;
+  match response.result.value {
+    Some(serde_json::Value::String(json_str)) => {
+      let Ok(data) =
+        serde_json::from_str::<HashMap<String, serde_json::Value>>(&json_str)
+      else {
+        eprintln!("Unexpected response from Jupyter.display: {json_str}");
+        return Ok(None);
+      };
 
-    if !data.is_empty() {
-      return Ok(Some(data));
+      if !data.is_empty() {
+        return Ok(Some(data));
+      }
     }
-  } else {
-    eprintln!(
-      "Unexpected response from Jupyter.display: {:?}",
-      response.result.clone().value
-    );
+    Some(serde_json::Value::Null) => {
+      // Object did not have the Jupyter display spec
+      return Ok(None);
+    }
+    _ => {
+      eprintln!(
+        "Unexpected response from Jupyter.display: {:?}",
+        response.result
+      )
+    }
   }
 
   Ok(None)

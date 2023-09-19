@@ -1,7 +1,6 @@
 // Copyright 2018-2023 the Deno authors. All rights reserved. MIT license.
 
 use super::analysis::CodeActionData;
-use super::analysis::TsResponseImportMapper;
 use super::code_lens;
 use super::config;
 use super::documents::AssetOrDocument;
@@ -234,6 +233,7 @@ impl TsServer {
     range: Range<u32>,
     codes: Vec<String>,
     format_code_settings: FormatCodeSettings,
+    preferences: UserPreferences,
   ) -> Vec<CodeFixAction> {
     let req = RequestMethod::GetCodeFixes((
       specifier,
@@ -241,6 +241,7 @@ impl TsServer {
       range.end,
       codes,
       format_code_settings,
+      preferences,
     ));
     match self.request(snapshot, req).await {
       Ok(items) => items,
@@ -260,6 +261,7 @@ impl TsServer {
     snapshot: Arc<StateSnapshot>,
     specifier: ModuleSpecifier,
     range: Range<u32>,
+    preferences: Option<UserPreferences>,
     only: String,
   ) -> Result<Vec<ApplicableRefactorInfo>, LspError> {
     let req = RequestMethod::GetApplicableRefactors((
@@ -268,6 +270,7 @@ impl TsServer {
         start: range.start,
         length: range.end - range.start,
       },
+      preferences,
       only,
     ));
     self.request(snapshot, req).await.map_err(|err| {
@@ -281,11 +284,13 @@ impl TsServer {
     snapshot: Arc<StateSnapshot>,
     code_action_data: &CodeActionData,
     format_code_settings: FormatCodeSettings,
+    preferences: UserPreferences,
   ) -> Result<CombinedCodeActions, LspError> {
     let req = RequestMethod::GetCombinedCodeFix((
       code_action_data.specifier.clone(),
       json!(code_action_data.fix_id.clone()),
       format_code_settings,
+      preferences,
     ));
     self.request(snapshot, req).await.map_err(|err| {
       log::error!("Unable to get combined fix from TypeScript: {}", err);
@@ -293,6 +298,7 @@ impl TsServer {
     })
   }
 
+  #[allow(clippy::too_many_arguments)]
   pub async fn get_edits_for_refactor(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -301,6 +307,7 @@ impl TsServer {
     range: Range<u32>,
     refactor_name: String,
     action_name: String,
+    preferences: Option<UserPreferences>,
   ) -> Result<RefactorEditInfo, LspError> {
     let req = RequestMethod::GetEditsForRefactor((
       specifier,
@@ -311,6 +318,7 @@ impl TsServer {
       },
       refactor_name,
       action_name,
+      preferences,
     ));
     self.request(snapshot, req).await.map_err(|err| {
       log::error!("Failed to request to tsserver {}", err);
@@ -2407,11 +2415,13 @@ fn parse_code_actions(
         let change_specifier = normalize_specifier(&change.file_name)?;
         if data.specifier == change_specifier {
           additional_text_edits.extend(change.text_changes.iter().map(|tc| {
-            update_import_statement(
-              tc.as_text_edit(asset_or_doc.line_index()),
-              data,
-              Some(&language_server.get_ts_response_import_mapper()),
-            )
+            let mut text_edit = tc.as_text_edit(asset_or_doc.line_index());
+            if let Some(specifier_rewrite) = &data.specifier_rewrite {
+              text_edit.new_text = text_edit
+                .new_text
+                .replace(&specifier_rewrite.0, &specifier_rewrite.1);
+            }
+            text_edit
           }));
         } else {
           has_remaining_commands_or_edits = true;
@@ -2646,6 +2656,11 @@ pub struct CompletionItemData {
   pub name: String,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub source: Option<String>,
+  /// If present, the code action / text edit corresponding to this item should
+  /// be rewritten by replacing the first string with the second. Intended for
+  /// auto-import specifiers to be reverse-import-mapped.
+  #[serde(skip_serializing_if = "Option::is_none")]
+  pub specifier_rewrite: Option<(String, String)>,
   #[serde(skip_serializing_if = "Option::is_none")]
   pub data: Option<Value>,
   pub use_code_snippet: bool,
@@ -2656,37 +2671,6 @@ pub struct CompletionItemData {
 struct CompletionEntryDataImport {
   module_specifier: String,
   file_name: String,
-}
-
-/// Modify an import statement text replacement to have the correct import
-/// specifier to work with Deno module resolution.
-fn update_import_statement(
-  mut text_edit: lsp::TextEdit,
-  item_data: &CompletionItemData,
-  maybe_import_mapper: Option<&TsResponseImportMapper>,
-) -> lsp::TextEdit {
-  if let Some(data) = &item_data.data {
-    if let Ok(import_data) =
-      serde_json::from_value::<CompletionEntryDataImport>(data.clone())
-    {
-      if let Ok(import_specifier) = normalize_specifier(&import_data.file_name)
-      {
-        if let Some(new_module_specifier) = maybe_import_mapper
-          .and_then(|m| {
-            m.check_specifier(&import_specifier, &item_data.specifier)
-          })
-          .or_else(|| {
-            relative_specifier(&item_data.specifier, &import_specifier)
-          })
-        {
-          text_edit.new_text = text_edit
-            .new_text
-            .replace(&import_data.module_specifier, &new_module_specifier);
-        }
-      }
-    }
-  }
-  text_edit
 }
 
 #[derive(Debug, Default, Deserialize, Serialize)]
@@ -2816,11 +2800,12 @@ impl CompletionEntry {
     let mut label_details: Option<lsp::CompletionItemLabelDetails> = None;
     let mut kind: Option<lsp::CompletionItemKind> =
       Some(self.kind.clone().into());
+    let mut specifier_rewrite = None;
 
-    let sort_text = if self.source.is_some() {
-      Some(format!("\u{ffff}{}", self.sort_text))
+    let mut sort_text = if self.source.is_some() {
+      format!("\u{ffff}{}", self.sort_text)
     } else {
-      Some(self.sort_text.clone())
+      self.sort_text.clone()
     };
 
     let preselect = self.is_recommended;
@@ -2870,7 +2855,7 @@ impl CompletionEntry {
     }
 
     if let Some(source) = &self.source {
-      let mut source = source.clone();
+      let mut display_source = source.clone();
       if let Some(data) = &self.data {
         if let Ok(import_data) =
           serde_json::from_value::<CompletionEntryDataImport>(data.clone())
@@ -2883,14 +2868,25 @@ impl CompletionEntry {
               .check_specifier(&import_specifier, specifier)
               .or_else(|| relative_specifier(specifier, &import_specifier))
             {
-              source = new_module_specifier;
+              display_source = new_module_specifier.clone();
+              if new_module_specifier != import_data.module_specifier {
+                specifier_rewrite =
+                  Some((import_data.module_specifier, new_module_specifier));
+              }
             }
           }
         }
       }
+      // We want relative or bare (import-mapped or otherwise) specifiers to
+      // appear at the top.
+      if resolve_url(&display_source).is_err() {
+        sort_text += "_0";
+      } else {
+        sort_text += "_1";
+      }
       label_details
         .get_or_insert_with(Default::default)
-        .description = Some(source);
+        .description = Some(display_source);
     }
 
     let text_edit =
@@ -2911,6 +2907,7 @@ impl CompletionEntry {
       position,
       name: self.name.clone(),
       source: self.source.clone(),
+      specifier_rewrite,
       data: self.data.clone(),
       use_code_snippet,
     };
@@ -2919,7 +2916,7 @@ impl CompletionEntry {
       label,
       label_details,
       kind,
-      sort_text,
+      sort_text: Some(sort_text),
       preselect,
       text_edit,
       filter_text,
@@ -3500,6 +3497,15 @@ pub enum QuotePreference {
   Single,
 }
 
+impl From<&FmtOptionsConfig> for QuotePreference {
+  fn from(config: &FmtOptionsConfig) -> Self {
+    match config.single_quote {
+      Some(true) => QuotePreference::Single,
+      _ => QuotePreference::Double,
+    }
+  }
+}
+
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "kebab-case")]
 #[allow(dead_code)]
@@ -3758,7 +3764,9 @@ enum RequestMethod {
   },
   GetAssets,
   /// Retrieve the possible refactor info for a range of a file.
-  GetApplicableRefactors((ModuleSpecifier, TextSpan, String)),
+  GetApplicableRefactors(
+    (ModuleSpecifier, TextSpan, Option<UserPreferences>, String),
+  ),
   /// Retrieve the refactor edit info for a range.
   GetEditsForRefactor(
     (
@@ -3767,6 +3775,7 @@ enum RequestMethod {
       TextSpan,
       String,
       String,
+      Option<UserPreferences>,
     ),
   ),
   /// Retrieve the refactor edit info for a range.
@@ -3779,7 +3788,16 @@ enum RequestMethod {
     ),
   ),
   /// Retrieve code fixes for a range of a file with the provided error codes.
-  GetCodeFixes((ModuleSpecifier, u32, u32, Vec<String>, FormatCodeSettings)),
+  GetCodeFixes(
+    (
+      ModuleSpecifier,
+      u32,
+      u32,
+      Vec<String>,
+      FormatCodeSettings,
+      UserPreferences,
+    ),
+  ),
   /// Get completion information at a given position (IntelliSense).
   GetCompletions(
     (
@@ -3792,7 +3810,9 @@ enum RequestMethod {
   /// Get details about a specific completion entry.
   GetCompletionDetails(GetCompletionDetailsArgs),
   /// Retrieve the combined code fixes for a fix id for a module.
-  GetCombinedCodeFix((ModuleSpecifier, Value, FormatCodeSettings)),
+  GetCombinedCodeFix(
+    (ModuleSpecifier, Value, FormatCodeSettings, UserPreferences),
+  ),
   /// Get declaration information for a specific position.
   GetDefinition((ModuleSpecifier, u32)),
   /// Return diagnostics for given file.
@@ -3869,11 +3889,17 @@ impl RequestMethod {
         "id": id,
         "method": "getAssets",
       }),
-      RequestMethod::GetApplicableRefactors((specifier, span, kind)) => json!({
+      RequestMethod::GetApplicableRefactors((
+        specifier,
+        span,
+        preferences,
+        kind,
+      )) => json!({
         "id": id,
         "method": "getApplicableRefactors",
         "specifier": state.denormalize_specifier(specifier),
         "range": { "pos": span.start, "end": span.start + span.length },
+        "preferences": preferences,
         "kind": kind,
       }),
       RequestMethod::GetEditsForRefactor((
@@ -3882,6 +3908,7 @@ impl RequestMethod {
         span,
         refactor_name,
         action_name,
+        preferences,
       )) => json!({
         "id": id,
         "method": "getEditsForRefactor",
@@ -3890,6 +3917,7 @@ impl RequestMethod {
         "range": { "pos": span.start, "end": span.start + span.length},
         "refactorName": refactor_name,
         "actionName": action_name,
+        "preferences": preferences,
       }),
       RequestMethod::GetEditsForFileRename((
         old_specifier,
@@ -3910,6 +3938,7 @@ impl RequestMethod {
         end_pos,
         error_codes,
         format_code_settings,
+        preferences,
       )) => json!({
         "id": id,
         "method": "getCodeFixes",
@@ -3918,17 +3947,20 @@ impl RequestMethod {
         "endPosition": end_pos,
         "errorCodes": error_codes,
         "formatCodeSettings": format_code_settings,
+        "preferences": preferences,
       }),
       RequestMethod::GetCombinedCodeFix((
         specifier,
         fix_id,
         format_code_settings,
+        preferences,
       )) => json!({
         "id": id,
         "method": "getCombinedCodeFix",
         "specifier": state.denormalize_specifier(specifier),
         "fixId": fix_id,
         "formatCodeSettings": format_code_settings,
+        "preferences": preferences,
       }),
       RequestMethod::GetCompletionDetails(args) => json!({
         "id": id,
@@ -4969,6 +5001,7 @@ mod tests {
     assert!(result.is_ok());
     let fmt_options_config = FmtOptionsConfig {
       semi_colons: Some(false),
+      single_quote: Some(true),
       ..Default::default()
     };
     let result = request(
@@ -4979,6 +5012,7 @@ mod tests {
         position,
         GetCompletionsAtPositionOptions {
           user_preferences: UserPreferences {
+            quote_preference: Some((&fmt_options_config).into()),
             include_completions_for_module_exports: Some(true),
             include_completions_with_insert_text: Some(true),
             ..Default::default()
@@ -5004,7 +5038,10 @@ mod tests {
         position,
         name: entry.name.clone(),
         source: entry.source.clone(),
-        preferences: None,
+        preferences: Some(UserPreferences {
+          quote_preference: Some((&fmt_options_config).into()),
+          ..Default::default()
+        }),
         format_code_settings: Some((&fmt_options_config).into()),
         data: entry.data.clone(),
       }),
@@ -5022,7 +5059,7 @@ mod tests {
     let change = changes.text_changes.first().unwrap();
     assert_eq!(
       change.new_text,
-      "import { someLongVariable } from \"./b.ts\"\n"
+      "import { someLongVariable } from './b.ts'\n"
     );
   }
 
@@ -5084,82 +5121,6 @@ mod tests {
         is_new_file: None,
       }]
     );
-  }
-
-  #[test]
-  fn test_update_import_statement() {
-    let fixtures = vec![
-      (
-        "file:///a/a.ts",
-        "./b",
-        "file:///a/b.ts",
-        "import { b } from \"./b\";\n\n",
-        "import { b } from \"./b.ts\";\n\n",
-      ),
-      (
-        "file:///a/a.ts",
-        "../b/b",
-        "file:///b/b.ts",
-        "import { b } from \"../b/b\";\n\n",
-        "import { b } from \"../b/b.ts\";\n\n",
-      ),
-      ("file:///a/a.ts", "./b", "file:///a/b.ts", ", b", ", b"),
-    ];
-
-    for (
-      specifier_text,
-      module_specifier,
-      file_name,
-      orig_text,
-      expected_text,
-    ) in fixtures
-    {
-      let specifier = ModuleSpecifier::parse(specifier_text).unwrap();
-      let item_data = CompletionItemData {
-        specifier: specifier.clone(),
-        position: 0,
-        name: "b".to_string(),
-        source: None,
-        data: Some(json!({
-          "moduleSpecifier": module_specifier,
-          "fileName": file_name,
-        })),
-        use_code_snippet: false,
-      };
-      let actual = update_import_statement(
-        lsp::TextEdit {
-          range: lsp::Range {
-            start: lsp::Position {
-              line: 0,
-              character: 0,
-            },
-            end: lsp::Position {
-              line: 0,
-              character: 0,
-            },
-          },
-          new_text: orig_text.to_string(),
-        },
-        &item_data,
-        None,
-      );
-      assert_eq!(
-        actual,
-        lsp::TextEdit {
-          range: lsp::Range {
-            start: lsp::Position {
-              line: 0,
-              character: 0,
-            },
-            end: lsp::Position {
-              line: 0,
-              character: 0,
-            },
-          },
-          new_text: expected_text.to_string(),
-        }
-      );
-    }
   }
 
   #[test]

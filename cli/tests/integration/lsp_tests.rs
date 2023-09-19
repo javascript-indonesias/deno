@@ -4045,24 +4045,6 @@ fn lsp_code_actions() {
   assert_eq!(
     res,
     json!([{
-      "title": "Add all missing 'async' modifiers",
-      "kind": "quickfix",
-      "diagnostics": [{
-        "range": {
-          "start": { "line": 1, "character": 2 },
-          "end": { "line": 1, "character": 7 }
-        },
-        "severity": 1,
-        "code": 1308,
-        "source": "deno-ts",
-        "message": "'await' expressions are only allowed within async functions and at the top levels of modules.",
-        "relatedInformation": []
-      }],
-      "data": {
-        "specifier": "file:///a/file.ts",
-        "fixId": "fixAwaitInSyncFunction"
-      }
-    }, {
       "title": "Add async modifier to containing function",
       "kind": "quickfix",
       "diagnostics": [{
@@ -4096,6 +4078,24 @@ fn lsp_code_actions() {
             "newText": "Promise<void>"
           }]
         }]
+      }
+    }, {
+      "title": "Add all missing 'async' modifiers",
+      "kind": "quickfix",
+      "diagnostics": [{
+        "range": {
+          "start": { "line": 1, "character": 2 },
+          "end": { "line": 1, "character": 7 }
+        },
+        "severity": 1,
+        "code": 1308,
+        "source": "deno-ts",
+        "message": "'await' expressions are only allowed within async functions and at the top levels of modules.",
+        "relatedInformation": []
+      }],
+      "data": {
+        "specifier": "file:///a/file.ts",
+        "fixId": "fixAwaitInSyncFunction"
       }
     }])
   );
@@ -4253,11 +4253,7 @@ fn test_lsp_code_actions_ordering() {
         "source": "deno",
       },
       {
-        "title": "Disable no-await-in-sync-fn for the entire file",
-        "source": "deno-lint",
-      },
-      {
-        "title": "Disable no-await-in-sync-fn for this line",
+        "title": "Disable prefer-const for this line",
         "source": "deno-lint",
       },
       {
@@ -4265,11 +4261,15 @@ fn test_lsp_code_actions_ordering() {
         "source": "deno-lint",
       },
       {
-        "title": "Disable prefer-const for this line",
+        "title": "Ignore lint errors for the entire file",
         "source": "deno-lint",
       },
       {
-        "title": "Ignore lint errors for the entire file",
+        "title": "Disable no-await-in-sync-fn for this line",
+        "source": "deno-lint",
+      },
+      {
+        "title": "Disable no-await-in-sync-fn for the entire file",
         "source": "deno-lint",
       },
       {
@@ -4543,7 +4543,7 @@ export class DuckConfig {
   assert_eq!(
     res,
     json!([{
-      "title": "Add all missing imports",
+      "title": "Add import from \"./file02.ts\"",
       "kind": "quickfix",
       "diagnostics": [{
         "range": {
@@ -4555,9 +4555,20 @@ export class DuckConfig {
         "source": "deno-ts",
         "message": "Cannot find name 'DuckConfigOptions'."
       }],
-      "data": {
-        "specifier": "file:///a/file00.ts",
-        "fixId": "fixMissingImport"
+      "edit": {
+        "documentChanges": [{
+          "textDocument": {
+            "uri": "file:///a/file00.ts",
+            "version": 1
+          },
+          "edits": [{
+            "range": {
+              "start": { "line": 0, "character": 0 },
+              "end": { "line": 0, "character": 0 }
+            },
+            "newText": "import { DuckConfigOptions } from \"./file02.ts\";\n\n"
+          }]
+        }]
       }
     }, {
       "title": "Add import from \"./file01.ts\"",
@@ -4588,7 +4599,7 @@ export class DuckConfig {
         }]
       }
     }, {
-      "title": "Add import from \"./file02.ts\"",
+      "title": "Add all missing imports",
       "kind": "quickfix",
       "diagnostics": [{
         "range": {
@@ -4600,20 +4611,9 @@ export class DuckConfig {
         "source": "deno-ts",
         "message": "Cannot find name 'DuckConfigOptions'."
       }],
-      "edit": {
-        "documentChanges": [{
-          "textDocument": {
-            "uri": "file:///a/file00.ts",
-            "version": 1
-          },
-          "edits": [{
-            "range": {
-              "start": { "line": 0, "character": 0 },
-              "end": { "line": 0, "character": 0 }
-            },
-            "newText": "import { DuckConfigOptions } from \"./file02.ts\";\n\n"
-          }]
-        }]
+      "data": {
+        "specifier": "file:///a/file00.ts",
+        "fixId": "fixMissingImport"
       }
     }])
   );
@@ -4903,6 +4903,174 @@ fn lsp_code_actions_refactor() {
       }
     })
   );
+  client.shutdown();
+}
+
+#[test]
+fn lsp_code_actions_imports_respects_fmt_config() {
+  let context = TestContextBuilder::new().use_temp_cwd().build();
+  let temp_dir = context.temp_dir();
+  temp_dir.write(
+    "./deno.jsonc",
+    json!({
+      "fmt": {
+        "semiColons": false,
+        "singleQuote": true,
+      }
+    })
+    .to_string(),
+  );
+  temp_dir.write(
+    "file00.ts",
+    r#"
+    export interface MallardDuckConfigOptions extends DuckConfigOptions {
+      kind: "mallard";
+    }
+  "#,
+  );
+  temp_dir.write(
+    "file01.ts",
+    r#"
+    export interface DuckConfigOptions {
+      kind: string;
+      quacks: boolean;
+    }
+  "#,
+  );
+  let mut client = context.new_lsp_command().build();
+  client.initialize_default();
+  client.did_open(json!({
+    "textDocument": {
+      "uri": temp_dir.uri().join("file00.ts").unwrap(),
+      "languageId": "typescript",
+      "version": 1,
+      "text": temp_dir.read_to_string("file00.ts"),
+    }
+  }));
+  client.did_open(json!({
+    "textDocument": {
+      "uri": temp_dir.uri().join("file01.ts").unwrap(),
+      "languageId": "typescript",
+      "version": 1,
+      "text": temp_dir.read_to_string("file01.ts"),
+    }
+  }));
+
+  let res = client.write_request(
+    "textDocument/codeAction",
+    json!({
+      "textDocument": {
+        "uri": temp_dir.uri().join("file00.ts").unwrap()
+      },
+      "range": {
+        "start": { "line": 0, "character": 0 },
+        "end": { "line": 4, "character": 0 }
+      },
+      "context": {
+        "diagnostics": [{
+          "range": {
+            "start": { "line": 1, "character": 55 },
+            "end": { "line": 1, "character": 64 }
+          },
+          "severity": 1,
+          "code": 2304,
+          "source": "deno-ts",
+          "message": "Cannot find name 'DuckConfigOptions'."
+        }],
+        "only": ["quickfix"]
+      }
+    }),
+  );
+  assert_eq!(
+    res,
+    json!([{
+      "title": "Add import from \"./file01.ts\"",
+      "kind": "quickfix",
+      "diagnostics": [{
+        "range": {
+          "start": { "line": 1, "character": 55 },
+          "end": { "line": 1, "character": 64 }
+        },
+        "severity": 1,
+        "code": 2304,
+        "source": "deno-ts",
+        "message": "Cannot find name 'DuckConfigOptions'."
+      }],
+      "edit": {
+        "documentChanges": [{
+          "textDocument": {
+            "uri": temp_dir.uri().join("file00.ts").unwrap(),
+            "version": 1
+          },
+          "edits": [{
+            "range": {
+              "start": { "line": 0, "character": 0 },
+              "end": { "line": 0, "character": 0 }
+            },
+            "newText": "import { DuckConfigOptions } from './file01.ts'\n"
+          }]
+        }]
+      }
+    }])
+  );
+  let res = client.write_request(
+    "codeAction/resolve",
+    json!({
+      "title": "Add all missing imports",
+      "kind": "quickfix",
+      "diagnostics": [{
+        "range": {
+          "start": { "line": 1, "character": 55 },
+          "end": { "line": 1, "character": 64 }
+        },
+        "severity": 1,
+        "code": 2304,
+        "source": "deno-ts",
+        "message": "Cannot find name 'DuckConfigOptions'."
+      }],
+      "data": {
+        "specifier": temp_dir.uri().join("file00.ts").unwrap(),
+        "fixId": "fixMissingImport"
+      }
+    }),
+  );
+  assert_eq!(
+    res,
+    json!({
+      "title": "Add all missing imports",
+      "kind": "quickfix",
+      "diagnostics": [{
+        "range": {
+          "start": { "line": 1, "character": 55 },
+          "end": { "line": 1, "character": 64 }
+        },
+        "severity": 1,
+        "code": 2304,
+        "source": "deno-ts",
+        "message": "Cannot find name 'DuckConfigOptions'."
+      }],
+      "edit": {
+        "documentChanges": [{
+          "textDocument": {
+            "uri": temp_dir.uri().join("file00.ts").unwrap(),
+            "version": 1
+          },
+          "edits": [{
+            "range": {
+              "start": { "line": 0, "character": 0 },
+              "end": { "line": 0, "character": 0 }
+            },
+            "newText": "import { DuckConfigOptions } from './file01.ts'\n"
+          }]
+        }]
+      },
+      "data": {
+        "specifier": temp_dir.uri().join("file00.ts").unwrap(),
+        "fixId": "fixMissingImport"
+      }
+    })
+  );
+
   client.shutdown();
 }
 
@@ -5308,7 +5476,7 @@ fn lsp_completions_auto_import() {
       "description": "./b.ts",
     },
     "kind": 6,
-    "sortText": "￿16",
+    "sortText": "￿16_0",
     "commitCharacters": [
       ".",
       ",",
@@ -5347,7 +5515,7 @@ fn lsp_completions_auto_import() {
         "kind": "markdown",
         "value": ""
       },
-      "sortText": "￿16",
+      "sortText": "￿16_0",
       "additionalTextEdits": [
         {
           "range": {
@@ -5430,7 +5598,7 @@ fn lsp_npm_completions_auto_import_and_quick_fix_no_import_map() {
         "kind": "markdown",
         "value": ""
       },
-      "sortText": "￿16",
+      "sortText": "￿16_1",
       "additionalTextEdits": [
         {
           "range": {
@@ -5540,7 +5708,7 @@ fn lsp_npm_completions_auto_import_and_quick_fix_no_import_map() {
         "description": "npm:chalk@5.0",
       },
       "kind": 6,
-      "sortText": "￿16",
+      "sortText": "￿16_1",
       "additionalTextEdits": [
         {
           "range": {
@@ -5748,7 +5916,7 @@ fn lsp_completions_auto_import_and_quick_fix_with_import_map() {
         "kind": "markdown",
         "value": ""
       },
-      "sortText": "￿16",
+      "sortText": "￿16_0",
       "additionalTextEdits": [
         {
           "range": {
@@ -5858,7 +6026,7 @@ fn lsp_completions_auto_import_and_quick_fix_with_import_map() {
         "description": "chalk",
       },
       "kind": 6,
-      "sortText": "￿16",
+      "sortText": "￿16_0",
       "additionalTextEdits": [
         {
           "range": {
@@ -5968,7 +6136,7 @@ fn lsp_completions_auto_import_and_quick_fix_with_import_map() {
         "description": "print_hello",
       },
       "kind": 3,
-      "sortText": "￿16",
+      "sortText": "￿16_0",
       "additionalTextEdits": [
         {
           "range": {
@@ -8185,31 +8353,6 @@ fn lsp_code_actions_ignore_lint() {
   assert_eq!(
     res,
     json!([{
-      "title": "Disable prefer-const for the entire file",
-      "kind": "quickfix",
-      "diagnostics": [{
-        "range": {
-          "start": { "line": 1, "character": 5 },
-          "end": { "line": 1, "character": 12 }
-        },
-        "severity": 1,
-        "code": "prefer-const",
-        "source": "deno-lint",
-        "message": "'message' is never reassigned\nUse 'const' instead",
-        "relatedInformation": []
-      }],
-      "edit": {
-        "changes": {
-          "file:///a/file.ts": [{
-            "range": {
-              "start": { "line": 0, "character": 0 },
-              "end": { "line": 0, "character": 0 }
-            },
-            "newText": "// deno-lint-ignore-file prefer-const\n"
-          }]
-        }
-      }
-    }, {
       "title": "Disable prefer-const for this line",
       "kind": "quickfix",
       "diagnostics": [{
@@ -8231,6 +8374,31 @@ fn lsp_code_actions_ignore_lint() {
               "end": { "line": 1, "character": 0 }
             },
             "newText": "// deno-lint-ignore prefer-const\n"
+          }]
+        }
+      }
+    }, {
+      "title": "Disable prefer-const for the entire file",
+      "kind": "quickfix",
+      "diagnostics": [{
+        "range": {
+          "start": { "line": 1, "character": 5 },
+          "end": { "line": 1, "character": 12 }
+        },
+        "severity": 1,
+        "code": "prefer-const",
+        "source": "deno-lint",
+        "message": "'message' is never reassigned\nUse 'const' instead",
+        "relatedInformation": []
+      }],
+      "edit": {
+        "changes": {
+          "file:///a/file.ts": [{
+            "range": {
+              "start": { "line": 0, "character": 0 },
+              "end": { "line": 0, "character": 0 }
+            },
+            "newText": "// deno-lint-ignore-file prefer-const\n"
           }]
         }
       }
@@ -8312,31 +8480,6 @@ console.log(snake_case);
   assert_eq!(
     res,
     json!([{
-      "title": "Disable prefer-const for the entire file",
-      "kind": "quickfix",
-      "diagnostics": [{
-        "range": {
-          "start": { "line": 3, "character": 5 },
-          "end": { "line": 3, "character": 15 }
-        },
-        "severity": 1,
-        "code": "prefer-const",
-        "source": "deno-lint",
-        "message": "'snake_case' is never reassigned\nUse 'const' instead",
-        "relatedInformation": []
-      }],
-      "edit": {
-        "changes": {
-          "file:///a/file.ts": [{
-            "range": {
-              "start": { "line": 1, "character": 34 },
-              "end": { "line": 1, "character": 34 }
-            },
-            "newText": " prefer-const"
-          }]
-        }
-      }
-    }, {
       "title": "Disable prefer-const for this line",
       "kind": "quickfix",
       "diagnostics": [{
@@ -8358,6 +8501,31 @@ console.log(snake_case);
               "end": { "line": 3, "character": 0 }
             },
             "newText": "// deno-lint-ignore prefer-const\n"
+          }]
+        }
+      }
+    }, {
+      "title": "Disable prefer-const for the entire file",
+      "kind": "quickfix",
+      "diagnostics": [{
+        "range": {
+          "start": { "line": 3, "character": 5 },
+          "end": { "line": 3, "character": 15 }
+        },
+        "severity": 1,
+        "code": "prefer-const",
+        "source": "deno-lint",
+        "message": "'snake_case' is never reassigned\nUse 'const' instead",
+        "relatedInformation": []
+      }],
+      "edit": {
+        "changes": {
+          "file:///a/file.ts": [{
+            "range": {
+              "start": { "line": 1, "character": 34 },
+              "end": { "line": 1, "character": 34 }
+            },
+            "newText": " prefer-const"
           }]
         }
       }
