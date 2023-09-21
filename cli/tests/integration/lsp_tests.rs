@@ -776,12 +776,12 @@ fn lsp_import_attributes() {
         "text": "{\"a\":1}"
       }
     }),
-    json!([{
+    &json!({ "deno": {
       "enable": true,
       "codeLens": {
         "test": true
       }
-    }]),
+    } }),
   );
 
   let diagnostics = client.did_open(json!({
@@ -1131,7 +1131,7 @@ fn lsp_hover_disabled() {
         "text": "console.log(Date.now());\n"
       }
     }),
-    json!([{ "enable": false }]),
+    &json!({ "deno": { "enable": false } }),
   );
 
   let res = client.write_request(
@@ -1329,11 +1329,11 @@ fn lsp_workspace_disable_enable_paths() {
           }])
           .set_deno_enable(false);
       },
-      json!([{
+      json!({ "deno": {
         "enable": false,
         "disablePaths": ["./worker/node.ts"],
         "enablePaths": ["./worker"],
-      }]),
+      } }),
     );
 
     client.did_open(json!({
@@ -3552,12 +3552,12 @@ fn lsp_code_lens_test_disabled() {
         }
       }),
       // disable test code lens
-      json!([{
+      &json!({ "deno": {
         "enable": true,
         "codeLens": {
           "test": false
         }
-      }]),
+      } }),
     );
   let res = client.write_request(
     "textDocument/codeLens",
@@ -5160,7 +5160,7 @@ fn lsp_code_actions_deadlock() {
       "text": large_file_text,
     }
   }));
-  client.handle_configuration_request(json!([{ "enable": true }]));
+  client.handle_configuration_request(&json!({ "deno": { "enable": true } }));
   client.write_request(
     "textDocument/semanticTokens/full",
     json!({
@@ -5796,9 +5796,9 @@ fn lsp_semantic_tokens_for_disabled_module() {
     |builder| {
       builder.set_deno_enable(false);
     },
-    json!({
+    json!({ "deno": {
       "enable": false
-    }),
+    } }),
   );
   client.did_open(json!({
     "textDocument": {
@@ -7848,6 +7848,40 @@ fn lsp_json_no_diagnostics() {
 }
 
 #[test]
+fn lsp_json_import_with_query_string() {
+  let context = TestContextBuilder::new().use_temp_cwd().build();
+  let temp_dir = context.temp_dir();
+  temp_dir.write("data.json", r#"{"k": "v"}"#);
+  temp_dir.write(
+    "main.ts",
+    r#"
+      import data from "./data.json?1" with { type: "json" };
+      console.log(data);
+    "#,
+  );
+  let mut client = context.new_lsp_command().build();
+  client.initialize_default();
+  client.did_open(json!({
+    "textDocument": {
+      "uri": temp_dir.uri().join("data.json").unwrap(),
+      "languageId": "json",
+      "version": 1,
+      "text": temp_dir.read_to_string("data.json"),
+    }
+  }));
+  let diagnostics = client.did_open(json!({
+    "textDocument": {
+      "uri": temp_dir.uri().join("main.ts").unwrap(),
+      "languageId": "typescript",
+      "version": 1,
+      "text": temp_dir.read_to_string("main.ts"),
+    }
+  }));
+  assert_eq!(diagnostics.all(), vec![]);
+  client.shutdown();
+}
+
+#[test]
 fn lsp_format_markdown() {
   let context = TestContextBuilder::new().use_temp_cwd().build();
   let mut client = context.new_lsp_command().build();
@@ -8062,7 +8096,7 @@ fn lsp_configuration_did_change() {
       "settings": {}
     }),
   );
-  let request = json!([{
+  let settings = json!({ "deno": {
     "enable": true,
     "codeLens": {
       "implementations": true,
@@ -8082,11 +8116,11 @@ fn lsp_configuration_did_change() {
       }
     },
     "unstable": false
-  }]);
+  } });
   // one for the workspace
-  client.handle_configuration_request(request.clone());
+  client.handle_configuration_request(&settings);
   // one for the specifier
-  client.handle_configuration_request(request);
+  client.handle_configuration_request(&settings);
 
   let list = client.get_completion_list(
     "file:///a/file.ts",
@@ -8158,16 +8192,20 @@ fn lsp_completions_complete_function_calls() {
       "settings": {}
     }),
   );
-  let request = json!([{
-    "enable": true,
-    "suggest": {
-      "completeFunctionCalls": true,
+  let settings = json!({
+    "deno": {
+      "enable": true,
     },
-  }]);
+    "typescript": {
+      "suggest": {
+        "completeFunctionCalls": true,
+      },
+    },
+  });
   // one for the workspace
-  client.handle_configuration_request(request.clone());
+  client.handle_configuration_request(&settings);
   // one for the specifier
-  client.handle_configuration_request(request);
+  client.handle_configuration_request(&settings);
 
   let list = client.get_completion_list(
     "file:///a/file.ts",
@@ -9198,7 +9236,7 @@ fn lsp_data_urls_with_jsx_compiler_option() {
         "end": { "line": 1, "character": 1 }
       }
     }, {
-      "uri": "deno:/ed0224c51f7e2a845dfc0941ed6959675e5e3e3d2a39b127f0ff569c1ffda8d8/data_url.ts",
+      "uri": "deno:/5c42b5916c4a3fb55be33fdb0c3b1f438639420592d150fca1b6dc043c1df3d9/data_url.ts",
       "range": {
         "start": { "line": 0, "character": 7 },
         "end": {"line": 0, "character": 14 },
@@ -9270,7 +9308,7 @@ fn lsp_node_modules_dir() {
       }),
     );
 
-    let request = json!([{
+    let settings = json!({ "deno": {
       "enable": true,
       "config": "./deno.json",
       "codeLens": {
@@ -9287,11 +9325,11 @@ fn lsp_node_modules_dir() {
         "imports": {}
       },
       "unstable": false
-    }]);
+    } });
     // one for the workspace
-    client.handle_configuration_request(request.clone());
+    client.handle_configuration_request(&settings);
     // one for the specifier
-    client.handle_configuration_request(request);
+    client.handle_configuration_request(&settings);
   };
   refresh_config(&mut client);
 
@@ -9405,7 +9443,7 @@ fn lsp_vendor_dir() {
       }),
     );
 
-    let request = json!([{
+    let settings = json!({ "deno": {
       "enable": true,
       "config": "./deno.json",
       "codeLens": {
@@ -9422,11 +9460,11 @@ fn lsp_vendor_dir() {
         "imports": {}
       },
       "unstable": false
-    }]);
+    } });
     // one for the workspace
-    client.handle_configuration_request(request.clone());
+    client.handle_configuration_request(&settings);
     // one for the specifier
-    client.handle_configuration_request(request);
+    client.handle_configuration_request(&settings);
   };
   refresh_config(&mut client);
 
