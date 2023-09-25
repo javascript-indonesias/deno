@@ -48,8 +48,10 @@ use super::config::ConfigSnapshot;
 use super::config::WorkspaceSettings;
 use super::config::SETTINGS_SECTION;
 use super::diagnostics;
+use super::diagnostics::DiagnosticDataSpecifier;
 use super::diagnostics::DiagnosticServerUpdateMessage;
 use super::diagnostics::DiagnosticsServer;
+use super::diagnostics::DiagnosticsState;
 use super::documents::to_hover_text;
 use super::documents::to_lsp_range;
 use super::documents::AssetOrDocument;
@@ -108,6 +110,7 @@ use crate::npm::NpmResolution;
 use crate::tools::fmt::format_file;
 use crate::tools::fmt::format_parsed_source;
 use crate::util::fs::remove_dir_all_if_exists;
+use crate::util::path::is_importable_ext;
 use crate::util::path::specifier_to_file_path;
 use crate::util::progress_bar::ProgressBar;
 use crate::util::progress_bar::ProgressBarStyle;
@@ -179,6 +182,7 @@ pub struct Inner {
   /// Configuration information.
   pub config: Config,
   deps_http_cache: Arc<dyn HttpCache>,
+  diagnostics_state: Arc<diagnostics::DiagnosticsState>,
   diagnostics_server: diagnostics::DiagnosticsServer,
   /// The collection of documents that the server is currently handling, either
   /// on disk or "open" within the client.
@@ -556,10 +560,12 @@ impl Inner {
     let ts_server =
       Arc::new(TsServer::new(performance.clone(), deps_http_cache.clone()));
     let config = Config::new();
+    let diagnostics_state = Arc::new(DiagnosticsState::default());
     let diagnostics_server = DiagnosticsServer::new(
       client.clone(),
       performance.clone(),
       ts_server.clone(),
+      diagnostics_state.clone(),
     );
     let assets = Assets::new(ts_server.clone());
     let registry_url = CliNpmRegistryApi::default_url();
@@ -586,6 +592,7 @@ impl Inner {
       client,
       config,
       deps_http_cache,
+      diagnostics_state,
       diagnostics_server,
       documents,
       http_client,
@@ -1051,13 +1058,8 @@ impl Inner {
             lsp_log!("Warning: Import map \"{}\" configured in \"{}\" being ignored due to an import map being explicitly configured in workspace settings.", import_map_path, config_file.specifier);
           }
         }
-        if let Ok(url) = Url::from_file_path(&import_map_str) {
+        if let Ok(url) = Url::parse(&import_map_str) {
           Some(url)
-        } else if import_map_str.starts_with("data:") {
-          let import_map_url = Url::parse(&import_map_str).map_err(|_| {
-            anyhow!("Bad data url for import map: {}", import_map_str)
-          })?;
-          Some(import_map_url)
         } else if let Some(root_uri) = self.config.root_uri() {
           let root_path = specifier_to_file_path(root_uri)?;
           let import_map_path = root_path.join(&import_map_str);
@@ -1446,6 +1448,7 @@ impl Inner {
 
   async fn did_close(&mut self, params: DidCloseTextDocumentParams) {
     let mark = self.performance.mark("did_close", Some(&params));
+    self.diagnostics_state.clear(&params.text_document.uri);
     if params.text_document.uri.scheme() == "deno" {
       // we can ignore virtual text documents closing, as they don't need to
       // be tracked in memory, as they are static assets that won't change
@@ -1912,6 +1915,7 @@ impl Inner {
       let file_diagnostics = self
         .diagnostics_server
         .get_ts_diagnostics(&specifier, asset_or_doc.document_lsp_version());
+      let mut includes_no_cache = false;
       for diagnostic in &fixable_diagnostics {
         match diagnostic.source.as_deref() {
           Some("deno-ts") => {
@@ -1955,12 +1959,21 @@ impl Inner {
               }
             }
           }
-          Some("deno") => code_actions
-            .add_deno_fix_action(&specifier, diagnostic)
-            .map_err(|err| {
-              error!("{}", err);
-              LspError::internal_error()
-            })?,
+          Some("deno") => {
+            if diagnostic.code
+              == Some(NumberOrString::String("no-cache".to_string()))
+              || diagnostic.code
+                == Some(NumberOrString::String("no-cache-npm".to_string()))
+            {
+              includes_no_cache = true;
+            }
+            code_actions
+              .add_deno_fix_action(&specifier, diagnostic)
+              .map_err(|err| {
+                error!("{}", err);
+                LspError::internal_error()
+              })?
+          }
           Some("deno-lint") => code_actions
             .add_deno_lint_ignore_action(
               &specifier,
@@ -1973,6 +1986,24 @@ impl Inner {
               LspError::internal_error()
             })?,
           _ => (),
+        }
+      }
+      if includes_no_cache {
+        let no_cache_diagnostics =
+          self.diagnostics_state.no_cache_diagnostics(&specifier);
+        let uncached_deps = no_cache_diagnostics
+          .iter()
+          .filter_map(|d| {
+            let data = serde_json::from_value::<DiagnosticDataSpecifier>(
+              d.data.clone().into(),
+            )
+            .ok()?;
+            Some(data.specifier)
+          })
+          .collect::<HashSet<_>>();
+        if uncached_deps.len() > 1 {
+          code_actions
+            .add_cache_all_action(&specifier, no_cache_diagnostics.to_owned());
         }
       }
       code_actions.set_preferred_fixes();
@@ -3267,9 +3298,35 @@ impl tower_lsp::LanguageServer for LanguageServer {
     self.0.write().await.did_change(params).await
   }
 
-  async fn did_save(&self, _params: DidSaveTextDocumentParams) {
-    // We don't need to do anything on save at the moment, but if this isn't
-    // implemented, lspower complains about it not being implemented.
+  async fn did_save(&self, params: DidSaveTextDocumentParams) {
+    let uri = &params.text_document.uri;
+    let Ok(path) = specifier_to_file_path(uri) else {
+      return;
+    };
+    if !is_importable_ext(&path) {
+      return;
+    }
+    {
+      let inner = self.0.read().await;
+      if !inner.config.workspace_settings().cache_on_save
+        || !inner.config.specifier_enabled(uri)
+        || !inner.diagnostics_state.has_no_cache_diagnostics(uri)
+      {
+        return;
+      }
+    }
+    if let Err(err) = self
+      .cache_request(Some(
+        serde_json::to_value(lsp_custom::CacheParams {
+          referrer: TextDocumentIdentifier { uri: uri.clone() },
+          uris: vec![TextDocumentIdentifier { uri: uri.clone() }],
+        })
+        .unwrap(),
+      ))
+      .await
+    {
+      lsp_warn!("Failed to cache \"{}\" on save: {}", uri.to_string(), err);
+    }
   }
 
   async fn did_close(&self, params: DidCloseTextDocumentParams) {
