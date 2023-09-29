@@ -158,6 +158,12 @@ impl LspNpmConfigHash {
 #[derive(Debug, Clone)]
 pub struct LanguageServer(Arc<tokio::sync::RwLock<Inner>>);
 
+#[derive(Debug)]
+pub struct StateNpmSnapshot {
+  pub node_resolver: Arc<NodeResolver>,
+  pub npm_resolver: Arc<CliNpmResolver>,
+}
+
 /// Snapshot of the state used by TSC.
 #[derive(Debug)]
 pub struct StateSnapshot {
@@ -166,8 +172,7 @@ pub struct StateSnapshot {
   pub config: Arc<ConfigSnapshot>,
   pub documents: Documents,
   pub maybe_import_map: Option<Arc<ImportMap>>,
-  pub maybe_node_resolver: Option<Arc<NodeResolver>>,
-  pub maybe_npm_resolver: Option<Arc<CliNpmResolver>>,
+  pub npm: Option<StateNpmSnapshot>,
 }
 
 #[derive(Debug)]
@@ -379,13 +384,6 @@ impl LanguageServer {
     } else {
       Err(LspError::invalid_request())
     }
-  }
-
-  pub async fn inlay_hint(
-    &self,
-    params: InlayHintParams,
-  ) -> LspResult<Option<Vec<InlayHint>>> {
-    self.0.read().await.inlay_hint(params).await
   }
 
   pub async fn virtual_text_document(
@@ -826,8 +824,10 @@ impl Inner {
       config: self.config.snapshot(),
       documents: self.documents.clone(),
       maybe_import_map: self.maybe_import_map.clone(),
-      maybe_node_resolver: Some(node_resolver),
-      maybe_npm_resolver: Some(npm_resolver),
+      npm: Some(StateNpmSnapshot {
+        node_resolver,
+        npm_resolver,
+      }),
     })
   }
 
@@ -3156,7 +3156,9 @@ impl tower_lsp::LanguageServer for LanguageServer {
         // are interested in.
         let options = DidChangeWatchedFilesRegistrationOptions {
           watchers: vec![FileSystemWatcher {
-            glob_pattern: "**/*.{json,jsonc,lock}".to_string(),
+            glob_pattern: GlobPattern::String(
+              "**/*.{json,jsonc,lock}".to_string(),
+            ),
             kind: None,
           }],
         };
@@ -3415,6 +3417,13 @@ impl tower_lsp::LanguageServer for LanguageServer {
 
   async fn hover(&self, params: HoverParams) -> LspResult<Option<Hover>> {
     self.0.read().await.hover(params).await
+  }
+
+  async fn inlay_hint(
+    &self,
+    params: InlayHintParams,
+  ) -> LspResult<Option<Vec<InlayHint>>> {
+    self.0.read().await.inlay_hint(params).await
   }
 
   async fn code_action(
@@ -3733,7 +3742,9 @@ impl Inner {
     let specifier = self
       .url_map
       .normalize_url(&params.text_document.uri, LspUrlKind::File);
-    let contents = if specifier.as_str() == "deno:/status.md" {
+    let contents = if specifier.scheme() == "deno"
+      && specifier.path() == "/status.md"
+    {
       let mut contents = String::new();
       let mut documents_specifiers = self
         .documents

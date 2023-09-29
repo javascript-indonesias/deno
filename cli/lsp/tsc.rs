@@ -49,6 +49,7 @@ use deno_core::JsRuntime;
 use deno_core::ModuleSpecifier;
 use deno_core::OpState;
 use deno_core::RuntimeOptions;
+use deno_runtime::deno_node::NpmResolver;
 use deno_runtime::tokio_util::create_basic_runtime;
 use lazy_regex::lazy_regex;
 use log::error;
@@ -2992,6 +2993,7 @@ impl OutliningSpan {
         Some(range.end.character)
       },
       kind: self.get_folding_range_kind(&self.kind),
+      collapsed_text: None,
     }
   }
 
@@ -3291,9 +3293,9 @@ fn op_is_node_file(state: &mut OpState, #[string] path: String) -> bool {
   match ModuleSpecifier::parse(&path) {
     Ok(specifier) => state
       .state_snapshot
-      .maybe_npm_resolver
+      .npm
       .as_ref()
-      .map(|r| r.in_npm_package(&specifier))
+      .map(|n| n.npm_resolver.in_npm_package(&specifier))
       .unwrap_or(false),
     Err(_) => false,
   }
@@ -3339,7 +3341,7 @@ fn op_resolve(
       let resolved = state.state_snapshot.documents.resolve(
         args.specifiers,
         &referrer_doc,
-        state.state_snapshot.maybe_node_resolver.as_ref(),
+        state.state_snapshot.npm.as_ref(),
       );
       Ok(
         resolved
@@ -3475,8 +3477,7 @@ deno_core::extension!(deno_tsc,
         config: Default::default(),
         documents: Documents::new(options.cache.clone()),
         maybe_import_map: None,
-        maybe_node_resolver: None,
-        maybe_npm_resolver: None,
+        npm: None,
       }),
       options.performance,
     ));
@@ -4302,8 +4303,7 @@ mod tests {
       cache_metadata: CacheMetadata::new(cache),
       config: Default::default(),
       maybe_import_map: None,
-      maybe_node_resolver: None,
-      maybe_npm_resolver: None,
+      npm: None,
     }
   }
 
