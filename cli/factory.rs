@@ -392,7 +392,7 @@ impl CliFactory {
           maybe_vendor_dir: self.options.vendor_dir_path(),
           bare_node_builtins_enabled: self
             .options
-            .unstable_bare_node_builtlins(),
+            .unstable_bare_node_builtins(),
         })))
       })
       .await
@@ -594,6 +594,12 @@ impl CliFactory {
       // feature_checker.set_warn_cb(Box::new(crate::unstable_warn_cb));
       if self.options.unstable() {
         checker.enable_legacy_unstable();
+      }
+      let unstable_features = self.options.unstable_features();
+      for (flag_name, _, _) in crate::UNSTABLE_GRANULAR_FLAGS {
+        if unstable_features.contains(&flag_name.to_string()) {
+          checker.enable_feature(flag_name);
+        }
       }
 
       Arc::new(checker)
