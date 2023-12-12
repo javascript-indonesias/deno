@@ -102,6 +102,7 @@ use crate::factory::CliFactory;
 use crate::file_fetcher::FileFetcher;
 use crate::graph_util;
 use crate::http_util::HttpClient;
+use crate::lsp::logging::init_log_file;
 use crate::lsp::tsc::file_text_changes_to_workspace_edit;
 use crate::lsp::urls::LspUrlKind;
 use crate::npm::create_cli_npm_resolver_for_lsp;
@@ -263,7 +264,7 @@ impl LanguageServer {
         .await?;
       graph_util::graph_valid(
         &graph,
-        factory.fs(),
+        factory.fs().as_ref(),
         &roots,
         graph_util::GraphValidOptions {
           is_vendoring: false,
@@ -3242,6 +3243,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
 
     {
       let mut ls = self.0.write().await;
+      init_log_file(ls.config.log_file());
       if let Err(err) = ls.update_tsconfig().await {
         ls.client.show_message(MessageType::WARNING, err);
       }
@@ -3807,15 +3809,11 @@ impl Inner {
       .unwrap();
       contents
         .push_str("\n## Performance\n\n|Name|Duration|Count|\n|---|---|---|\n");
-      let mut averages = self.performance.averages();
-      averages.sort();
-      for average in averages {
-        writeln!(
-          contents,
-          "|{}|{}ms|{}|",
-          average.name, average.average_duration, average.count
-        )
-        .unwrap();
+      let mut averages = self.performance.averages_as_f64();
+      averages.sort_by(|a, b| a.0.cmp(&b.0));
+      for (name, count, average_duration) in averages {
+        writeln!(contents, "|{}|{}ms|{}|", name, average_duration, count)
+          .unwrap();
       }
       Some(contents)
     } else {
