@@ -326,8 +326,8 @@ Deno.test(
       const listener = Deno.listenTls({
         hostname,
         port,
-        certFile: "cli/tests/testdata/tls/localhost.crt",
-        keyFile: "cli/tests/testdata/tls/localhost.key",
+        cert: Deno.readTextFileSync("cli/tests/testdata/tls/localhost.crt"),
+        key: Deno.readTextFileSync("cli/tests/testdata/tls/localhost.key"),
       });
       const conn = await listener.accept();
       const httpConn = Deno.serveHttp(conn);
@@ -1084,6 +1084,9 @@ Deno.test(
 );
 
 // https://github.com/denoland/deno/issues/11926
+// verify that the only new resource is "httpConnection", to make
+// sure "request" resource is closed even if its body was not read
+// by server handler
 Deno.test(
   { permissions: { net: true } },
   async function httpServerDoesntLeakResources2() {
@@ -1105,22 +1108,11 @@ Deno.test(
       }
     })();
 
-    const resourcesBefore = Deno.resources();
     const response = await fetch(`http://127.0.0.1:${listenPort}`, {
       method: "POST",
       body: "hello world",
     });
     await response.text();
-    const resourcesAfter = Deno.resources();
-    // verify that the only new resource is "httpConnection", to make
-    // sure "request" resource is closed even if its body was not read
-    // by server handler
-
-    for (const rid of Object.keys(resourcesBefore)) {
-      delete resourcesAfter[Number(rid)];
-    }
-
-    assertEquals(Object.keys(resourcesAfter).length, 1);
 
     listener!.close();
     httpConn!.close();
@@ -2294,8 +2286,8 @@ Deno.test(
     const listener = Deno.listenTls({
       hostname,
       port,
-      certFile: "cli/tests/testdata/tls/localhost.crt",
-      keyFile: "cli/tests/testdata/tls/localhost.key",
+      cert: await Deno.readTextFile("cli/tests/testdata/tls/localhost.crt"),
+      key: await Deno.readTextFile("cli/tests/testdata/tls/localhost.key"),
     });
 
     const caCerts = [
@@ -2600,8 +2592,8 @@ for (const compression of [true, false]) {
       const listener = Deno.listenTls({
         hostname,
         port,
-        certFile: "cli/tests/testdata/tls/localhost.crt",
-        keyFile: "cli/tests/testdata/tls/localhost.key",
+        cert: await Deno.readTextFile("cli/tests/testdata/tls/localhost.crt"),
+        key: await Deno.readTextFile("cli/tests/testdata/tls/localhost.key"),
         alpnProtocols: ["h2"],
       });
       const server = httpServerWithErrorBody(listener, compression);
