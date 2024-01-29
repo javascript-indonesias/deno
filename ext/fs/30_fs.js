@@ -3,8 +3,10 @@
 import { core, internals, primordials } from "ext:core/mod.js";
 const {
   isDate,
+  internalRidSymbol,
 } = core;
-const {
+import {
+  op_cancel_handle,
   op_fs_chdir,
   op_fs_chmod_async,
   op_fs_chmod_sync,
@@ -14,16 +16,16 @@ const {
   op_fs_copy_file_sync,
   op_fs_cwd,
   op_fs_fdatasync_async,
-  op_fs_fdatasync_sync,
   op_fs_fdatasync_async_unstable,
+  op_fs_fdatasync_sync,
   op_fs_fdatasync_sync_unstable,
   op_fs_flock_async,
   op_fs_flock_sync,
   op_fs_fstat_async,
   op_fs_fstat_sync,
   op_fs_fsync_async,
-  op_fs_fsync_sync,
   op_fs_fsync_async_unstable,
+  op_fs_fsync_sync,
   op_fs_fsync_sync_unstable,
   op_fs_ftruncate_async,
   op_fs_ftruncate_sync,
@@ -70,10 +72,7 @@ const {
   op_fs_utime_sync,
   op_fs_write_file_async,
   op_fs_write_file_sync,
-} = core.ensureFastOps();
-const {
-  op_cancel_handle,
-} = core.ensureFastOps(true);
+} from "ext:core/ops";
 const {
   ArrayPrototypeFilter,
   Date,
@@ -82,6 +81,7 @@ const {
   Function,
   MathTrunc,
   ObjectEntries,
+  ObjectDefineProperty,
   ObjectPrototypeIsPrototypeOf,
   ObjectValues,
   StringPrototypeSlice,
@@ -655,14 +655,16 @@ function create(path) {
 }
 
 class FsFile {
-  [SymbolFor("Deno.internal.rid")] = 0;
   #rid = 0;
 
   #readable;
   #writable;
 
   constructor(rid, symbol) {
-    this[SymbolFor("Deno.internal.rid")] = rid;
+    ObjectDefineProperty(this, internalRidSymbol, {
+      enumerable: false,
+      value: rid,
+    });
     this.#rid = rid;
     if (!symbol || symbol !== SymbolFor("Deno.internal.FsFile")) {
       internals.warnOnDeprecatedApi(

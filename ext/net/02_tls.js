@@ -1,16 +1,17 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
 import { core, internals, primordials } from "ext:core/mod.js";
-const {
+const { internalRidSymbol } = core;
+import {
   op_net_accept_tls,
   op_net_connect_tls,
   op_net_listen_tls,
   op_tls_handshake,
   op_tls_start,
-} = core.ensureFastOps();
+} from "ext:core/ops";
 const {
   Number,
-  SymbolFor,
+  ObjectDefineProperty,
   TypeError,
 } = primordials;
 
@@ -25,12 +26,14 @@ function opTlsHandshake(rid) {
 }
 
 class TlsConn extends Conn {
-  [SymbolFor("Deno.internal.rid")] = 0;
   #rid = 0;
 
   constructor(rid, remoteAddr, localAddr) {
     super(rid, remoteAddr, localAddr);
-    this[SymbolFor("Deno.internal.rid")] = rid;
+    ObjectDefineProperty(this, internalRidSymbol, {
+      enumerable: false,
+      value: rid,
+    });
     this.#rid = rid;
   }
 
@@ -78,12 +81,14 @@ async function connectTls({
 }
 
 class TlsListener extends Listener {
-  [SymbolFor("Deno.internal.rid")] = 0;
   #rid = 0;
 
   constructor(rid, addr) {
     super(rid, addr);
-    this[SymbolFor("Deno.internal.rid")] = rid;
+    ObjectDefineProperty(this, internalRidSymbol, {
+      enumerable: false,
+      value: rid,
+    });
     this.#rid = rid;
   }
 
@@ -151,7 +156,7 @@ async function startTls(
   } = {},
 ) {
   const { 0: rid, 1: localAddr, 2: remoteAddr } = await opStartTls({
-    rid: conn[SymbolFor("Deno.internal.rid")],
+    rid: conn[internalRidSymbol],
     hostname,
     certFile,
     caCerts,
