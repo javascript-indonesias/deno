@@ -9,6 +9,7 @@ const cacheVersion = 73;
 
 const ubuntuX86Runner = "ubuntu-22.04";
 const ubuntuX86XlRunner = "ubuntu-22.04-xl";
+const ubuntuARMRunner = "ubicloud-standard-16-arm";
 const windowsX86Runner = "windows-2022";
 const windowsX86XlRunner = "windows-2022-xl";
 const macosX86Runner = "macos-12";
@@ -25,6 +26,11 @@ const Runners = {
     arch: "x86_64",
     runner:
       `\${{ github.repository == 'denoland/deno' && '${ubuntuX86XlRunner}' || '${ubuntuX86Runner}' }}`,
+  },
+  linuxArm: {
+    os: "linux",
+    arch: "aarch64",
+    runner: ubuntuARMRunner,
   },
   macosX86: {
     os: "macos",
@@ -58,11 +64,14 @@ const installPkgsCommand =
   `sudo apt-get install --no-install-recommends debootstrap clang-${llvmVersion} lld-${llvmVersion} clang-tools-${llvmVersion} clang-format-${llvmVersion} clang-tidy-${llvmVersion}`;
 const sysRootStep = {
   name: "Set up incremental LTO and sysroot build",
-  run: `# Avoid running man-db triggers, which sometimes takes several minutes
+  run: `# Setting up sysroot
+export DEBIAN_FRONTEND=noninteractive
+# Avoid running man-db triggers, which sometimes takes several minutes
 # to complete.
-sudo apt-get remove --purge -y man-db
+sudo apt-get -qq remove --purge -y man-db  > /dev/null 2> /dev/null
 # Remove older clang before we install
-sudo apt-get remove 'clang-12*' 'clang-13*' 'clang-14*' 'clang-15*' 'llvm-12*' 'llvm-13*' 'llvm-14*' 'llvm-15*' 'lld-12*' 'lld-13*' 'lld-14*' 'lld-15*'
+sudo apt-get -qq remove \
+  'clang-12*' 'clang-13*' 'clang-14*' 'clang-15*' 'llvm-12*' 'llvm-13*' 'llvm-14*' 'llvm-15*' 'lld-12*' 'lld-13*' 'lld-14*' 'lld-15*' > /dev/null 2> /dev/null
 
 # Install clang-XXX, lld-XXX, and debootstrap.
 echo "deb http://apt.llvm.org/jammy/ llvm-toolchain-jammy-${llvmVersion} main" |
@@ -74,27 +83,29 @@ sudo apt-get update
 # this was unreliable sometimes, so try again if it fails
 ${installPkgsCommand} || echo 'Failed. Trying again.' && sudo apt-get clean && sudo apt-get update && ${installPkgsCommand}
 # Fix alternatives
-(yes '' | sudo update-alternatives --force --all) || true
+(yes '' | sudo update-alternatives --force --all) > /dev/null 2> /dev/null || true
 
-# Create ubuntu-16.04 sysroot environment, which is used to avoid
-# depending on a very recent version of glibc.
-# \`libc6-dev\` is required for building any C source files.
-# \`file\` and \`make\` are needed to build libffi-sys.
-# \`curl\` is needed to build rusty_v8.
-sudo debootstrap                                     \\
-  --include=ca-certificates,curl,file,libc6-dev,make \\
-  --no-merged-usr --variant=minbase xenial /sysroot  \\
-  http://azure.archive.ubuntu.com/ubuntu
+echo "Decompressing sysroot..."
+wget -q https://github.com/denoland/deno_sysroot_build/releases/download/sysroot-20240207/sysroot-\`uname -m\`.tar.xz -O /tmp/sysroot.tar.xz
+cd /
+xzcat /tmp/sysroot.tar.xz | sudo tar -x
 sudo mount --rbind /dev /sysroot/dev
 sudo mount --rbind /sys /sysroot/sys
 sudo mount --rbind /home /sysroot/home
 sudo mount -t proc /proc /sysroot/proc
+cd
 
-wget https://github.com/denoland/deno_third_party/raw/master/prebuilt/linux64/libdl/libdl.a
-wget https://github.com/denoland/deno_third_party/raw/master/prebuilt/linux64/libdl/libdl.so.2
-
-sudo ln -s libdl.so.2 /sysroot/lib/x86_64-linux-gnu/libdl.so
-sudo ln -s libdl.a /sysroot/lib/x86_64-linux-gnu/libdl.a
+if [[ \`uname -m\` == "aarch64" ]]; then
+  echo "Copying libdl.a"
+  sudo cp /sysroot/usr/lib/aarch64-linux-gnu/libdl.a /sysroot/lib/aarch64-linux-gnu/libdl.a
+  echo "Copying libdl.so"
+  sudo cp /sysroot/lib/aarch64-linux-gnu/libdl.so.2 /sysroot/lib/aarch64-linux-gnu/libdl.so
+else
+  echo "Copying libdl.a"
+  sudo cp /sysroot/usr/lib/x86_64-linux-gnu/libdl.a /sysroot/lib/x86_64-linux-gnu/libdl.a
+  echo "Copying libdl.so"
+  sudo cp /sysroot/lib/x86_64-linux-gnu/libdl.so.2 /sysroot/lib/x86_64-linux-gnu/libdl.so
+fi
 
 # Configure the build environment. Both Rust and Clang will produce
 # llvm bitcode only, so we can use lld's incremental LTO support.
@@ -141,7 +152,7 @@ const cloneRepoStep = [{
   ].join("\n"),
 }, {
   name: "Clone repository",
-  uses: "actions/checkout@v3",
+  uses: "actions/checkout@v4",
   with: {
     // Use depth > 1, because sometimes we need to rebuild main and if
     // other commits have landed it will become impossible to rebuild if
@@ -181,7 +192,7 @@ const installNodeStep = {
 };
 const installProtocStep = {
   name: "Install protoc",
-  uses: "arduino/setup-protoc@v2",
+  uses: "arduino/setup-protoc@v3",
   with: { "version": "21.12", "repo-token": "${{ secrets.GITHUB_TOKEN }}" },
 };
 const installDenoStep = {
@@ -400,6 +411,15 @@ const ci = {
             job: "lint",
             profile: "debug",
           }, {
+            ...Runners.linuxArm,
+            job: "test",
+            profile: "debug",
+          }, {
+            ...Runners.linuxArm,
+            job: "test",
+            profile: "release",
+            use_sysroot: true,
+          }, {
             ...Runners.macosX86,
             job: "lint",
             profile: "debug",
@@ -456,7 +476,10 @@ const ci = {
           ...installDenoStep,
         },
         ...installPythonSteps.map((s) =>
-          withCondition(s, "matrix.job != 'lint'")
+          withCondition(
+            s,
+            "matrix.job != 'lint' && (matrix.os != 'linux' || matrix.arch != 'aarch64')",
+          )
         ),
         {
           // only necessary for benchmarks
@@ -558,7 +581,7 @@ const ci = {
         },
         {
           name: "Cache Cargo home",
-          uses: "actions/cache@v3",
+          uses: "actions/cache@v4",
           with: {
             // See https://doc.rust-lang.org/cargo/guide/cargo-home.html#caching-the-cargo-home-in-ci
             // Note that with the new sparse registry format, we no longer have to cache a `.git` dir
@@ -659,9 +682,10 @@ const ci = {
             "(github.ref == 'refs/heads/main' ||",
             "startsWith(github.ref, 'refs/tags/'))))",
           ].join("\n"),
-          uses: "actions/upload-artifact@v3",
+          uses: "actions/upload-artifact@v4",
           with: {
-            name: "deno-${{ github.event.number }}",
+            name:
+              "deno-${{ matrix.os }}-${{ matrix.arch }}-${{ github.event.number }}",
             path: "target/release/deno",
           },
         },
@@ -732,7 +756,7 @@ const ci = {
         {
           name: "Autobahn testsuite",
           if: [
-            "matrix.os == 'linux' &&",
+            "(matrix.os == 'linux' && matrix.arch != 'aarch64') &&",
             "matrix.job == 'test' &&",
             "matrix.profile == 'release' &&",
             "!startsWith(github.ref, 'refs/tags/')",
@@ -791,8 +815,10 @@ const ci = {
         },
         {
           // Verify that the binary actually works in the Ubuntu-16.04 sysroot.
+          // TODO(mmastrac): make this work for aarch64 as well
           name: "Check deno binary (in sysroot)",
-          if: "matrix.profile == 'release' && matrix.use_sysroot",
+          if:
+            "matrix.profile == 'release' && matrix.use_sysroot && matrix.arch != 'aarch64'",
           run: 'sudo chroot /sysroot "$(pwd)/target/release/deno" --version',
         },
         {
@@ -990,7 +1016,7 @@ const ci = {
         {
           // In main branch, always create a fresh cache
           name: "Save cache build output (main)",
-          uses: "actions/cache/save@v3",
+          uses: "actions/cache/save@v4",
           if:
             "(matrix.job == 'test' || matrix.job == 'lint') && github.ref == 'refs/heads/main'",
           with: {
