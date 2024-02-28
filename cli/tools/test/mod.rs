@@ -37,7 +37,6 @@ use deno_core::futures::stream;
 use deno_core::futures::FutureExt;
 use deno_core::futures::StreamExt;
 use deno_core::located_script_name;
-use deno_core::parking_lot::Mutex;
 use deno_core::serde_v8;
 use deno_core::stats::RuntimeActivity;
 use deno_core::stats::RuntimeActivityDiff;
@@ -71,7 +70,6 @@ use std::collections::HashMap;
 use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::future::poll_fn;
-use std::io::Read;
 use std::io::Write;
 use std::num::NonZeroUsize;
 use std::path::Path;
@@ -84,14 +82,16 @@ use std::time::Duration;
 use std::time::Instant;
 use std::time::SystemTime;
 use tokio::signal;
-use tokio::sync::mpsc::unbounded_channel;
-use tokio::sync::mpsc::UnboundedReceiver;
-use tokio::sync::mpsc::UnboundedSender;
-use tokio::sync::mpsc::WeakUnboundedSender;
 
+mod channel;
 pub mod fmt;
 pub mod reporters;
 
+pub use channel::create_single_test_event_channel;
+pub use channel::create_test_event_channel;
+pub use channel::TestEventReceiver;
+pub use channel::TestEventSender;
+pub use channel::TestEventWorkerSender;
 use fmt::format_sanitizer_diff;
 pub use fmt::format_test_error;
 use reporters::CompoundTestReporter;
@@ -173,6 +173,51 @@ pub struct TestLocation {
   pub file_name: String,
   pub line_number: u32,
   pub column_number: u32,
+}
+
+#[derive(Default)]
+pub(crate) struct TestContainer(
+  TestDescriptions,
+  Vec<v8::Global<v8::Function>>,
+);
+
+impl TestContainer {
+  pub fn register(
+    &mut self,
+    description: TestDescription,
+    function: v8::Global<v8::Function>,
+  ) {
+    self.0.tests.insert(description.id, description);
+    self.1.push(function)
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.1.is_empty()
+  }
+}
+
+#[derive(Default, Debug)]
+pub struct TestDescriptions {
+  tests: IndexMap<usize, TestDescription>,
+}
+
+impl TestDescriptions {
+  pub fn len(&self) -> usize {
+    self.tests.len()
+  }
+
+  pub fn is_empty(&self) -> bool {
+    self.tests.is_empty()
+  }
+}
+
+impl<'a> IntoIterator for &'a TestDescriptions {
+  type Item = <&'a IndexMap<usize, TestDescription> as IntoIterator>::Item;
+  type IntoIter =
+    <&'a IndexMap<usize, TestDescription> as IntoIterator>::IntoIter;
+  fn into_iter(self) -> Self::IntoIter {
+    (&self.tests).into_iter()
+  }
 }
 
 #[derive(Debug, Clone, PartialEq, Deserialize, Eq, Hash)]
@@ -329,13 +374,18 @@ pub struct TestPlan {
   pub used_only: bool,
 }
 
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Deserialize)]
+pub enum TestStdioStream {
+  Stdout,
+  Stderr,
+}
+
+#[derive(Debug)]
 pub enum TestEvent {
-  Register(TestDescription),
+  Register(Arc<TestDescriptions>),
   Plan(TestPlan),
   Wait(usize),
-  Output(Vec<u8>),
+  Output(TestStdioStream, Vec<u8>),
   Result(usize, TestResult, u64),
   UncaughtError(String, Box<JsError>),
   StepRegister(TestStepDescription),
@@ -343,6 +393,21 @@ pub enum TestEvent {
   StepResult(usize, TestStepResult, u64),
   ForceEndReport,
   Sigint,
+}
+
+impl TestEvent {
+  // Certain messages require us to ensure that all output has been drained to ensure proper
+  // interleaving of output messages.
+  pub fn requires_stdio_sync(&self) -> bool {
+    matches!(
+      self,
+      TestEvent::Result(..)
+        | TestEvent::StepWait(..)
+        | TestEvent::StepResult(..)
+        | TestEvent::UncaughtError(..)
+        | TestEvent::ForceEndReport
+    )
+  }
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -432,7 +497,7 @@ pub async fn test_specifier(
   worker_factory: Arc<CliMainWorkerFactory>,
   permissions: Permissions,
   specifier: ModuleSpecifier,
-  mut sender: TestEventSender,
+  mut worker_sender: TestEventWorkerSender,
   fail_fast_tracker: FailFastTracker,
   options: TestSpecifierOptions,
 ) -> Result<(), AnyError> {
@@ -440,7 +505,9 @@ pub async fn test_specifier(
     worker_factory,
     permissions,
     specifier.clone(),
-    &sender,
+    &worker_sender.sender,
+    StdioPipe::file(worker_sender.stdout),
+    StdioPipe::file(worker_sender.stderr),
     fail_fast_tracker,
     options,
   )
@@ -449,7 +516,7 @@ pub async fn test_specifier(
     Ok(()) => Ok(()),
     Err(error) => {
       if error.is::<JsError>() {
-        sender.send(TestEvent::UncaughtError(
+        worker_sender.sender.send(TestEvent::UncaughtError(
           specifier.to_string(),
           Box::new(error.downcast::<JsError>().unwrap()),
         ))?;
@@ -463,26 +530,27 @@ pub async fn test_specifier(
 
 /// Test a single specifier as documentation containing test programs, an executable test module or
 /// both.
+#[allow(clippy::too_many_arguments)]
 async fn test_specifier_inner(
   worker_factory: Arc<CliMainWorkerFactory>,
   permissions: Permissions,
   specifier: ModuleSpecifier,
   sender: &TestEventSender,
+  stdout: StdioPipe,
+  stderr: StdioPipe,
   fail_fast_tracker: FailFastTracker,
   options: TestSpecifierOptions,
 ) -> Result<(), AnyError> {
   if fail_fast_tracker.should_stop() {
     return Ok(());
   }
-  let stdout = StdioPipe::File(sender.stdout());
-  let stderr = StdioPipe::File(sender.stderr());
   let mut worker = worker_factory
     .create_custom_worker(
       specifier.clone(),
       PermissionsContainer::new(permissions),
       vec![ops::testing::deno_test::init_ops(sender.clone())],
       Stdio {
-        stdin: StdioPipe::Inherit,
+        stdin: StdioPipe::inherit(),
         stdout,
         stderr,
       },
@@ -494,7 +562,7 @@ async fn test_specifier_inner(
   if options.trace_ops {
     worker.execute_script_static(
       located_script_name!(),
-      "Deno[Deno.internal].core.setOpCallTracingEnabled(true);",
+      "Deno[Deno.internal].core.setLeakTracingEnabled(true);",
     )?;
   }
 
@@ -535,7 +603,7 @@ async fn test_specifier_inner(
 pub fn worker_has_tests(worker: &mut MainWorker) -> bool {
   let state_rc = worker.js_runtime.op_state();
   let state = state_rc.borrow();
-  !state.borrow::<ops::testing::TestContainer>().0.is_empty()
+  !state.borrow::<TestContainer>().is_empty()
 }
 
 /// Yields to tokio to allow async work to process, and then polls
@@ -563,21 +631,23 @@ pub async fn run_tests_for_worker(
   options: &TestSpecifierOptions,
   fail_fast_tracker: &FailFastTracker,
 ) -> Result<(), AnyError> {
-  let (tests, mut sender) = {
+  let (TestContainer(tests, test_functions), mut sender) = {
     let state_rc = worker.js_runtime.op_state();
     let mut state = state_rc.borrow_mut();
     (
-      std::mem::take(&mut state.borrow_mut::<ops::testing::TestContainer>().0),
+      std::mem::take(&mut *state.borrow_mut::<TestContainer>()),
       state.borrow::<TestEventSender>().clone(),
     )
   };
+  let tests: Arc<TestDescriptions> = tests.into();
+  sender.send(TestEvent::Register(tests.clone()))?;
   let unfiltered = tests.len();
   let tests = tests
     .into_iter()
-    .filter(|(d, _)| options.filter.includes(&d.name))
+    .filter(|(_, d)| options.filter.includes(&d.name))
     .collect::<Vec<_>>();
   let (only, no_only): (Vec<_>, Vec<_>) =
-    tests.into_iter().partition(|(d, _)| d.only);
+    tests.into_iter().partition(|(_, d)| d.only);
   let used_only = !only.is_empty();
   let mut tests = if used_only { only } else { no_only };
   if let Some(seed) = options.shuffle {
@@ -613,7 +683,7 @@ pub async fn run_tests_for_worker(
   filter = filter.omit_op(op_id_host_recv_ctrl as _);
   filter = filter.omit_op(op_id_host_recv_message as _);
 
-  for (desc, function) in tests {
+  for ((_, desc), function) in tests.into_iter().zip(test_functions) {
     if fail_fast_tracker.should_stop() {
       break;
     }
@@ -716,7 +786,7 @@ fn preprocess_timer_activity(activities: &mut Vec<RuntimeActivity>) {
 
   // First, search for any timer resources which will indicate that we have an interval leak
   activities.retain(|activity| {
-    if let RuntimeActivity::Resource(_, name) = activity {
+    if let RuntimeActivity::Resource(.., name) = activity {
       if name == "timer" {
         timer_resource_leaked = true;
         return false;
@@ -729,7 +799,7 @@ fn preprocess_timer_activity(activities: &mut Vec<RuntimeActivity>) {
   // them.
   if !timer_resource_leaked {
     activities.retain(|activity| {
-      if let RuntimeActivity::AsyncOp(_, op, _) = activity {
+      if let RuntimeActivity::AsyncOp(.., op) = activity {
         *op != "op_sleep_interval"
       } else {
         true
@@ -751,7 +821,7 @@ async fn wait_for_activity_to_stabilize(
   let mut diff = RuntimeActivityStats::diff(&before, &after);
   preprocess_timer_activity(&mut diff.appeared);
   preprocess_timer_activity(&mut diff.disappeared);
-  if diff.appeared.is_empty() && diff.disappeared.is_empty() {
+  if diff.is_empty() {
     // No activity, so we return early
     return Ok(None);
   }
@@ -768,7 +838,7 @@ async fn wait_for_activity_to_stabilize(
     diff = RuntimeActivityStats::diff(&before, &after);
     preprocess_timer_activity(&mut diff.appeared);
     preprocess_timer_activity(&mut diff.disappeared);
-    if diff.appeared.is_empty() && diff.disappeared.is_empty() {
+    if diff.is_empty() {
       return Ok(None);
     }
   }
@@ -790,11 +860,7 @@ async fn wait_for_activity_to_stabilize(
       .retain(|activity| !matches!(activity, RuntimeActivity::Resource(..)));
   }
 
-  Ok(if diff.appeared.is_empty() && diff.disappeared.is_empty() {
-    None
-  } else {
-    Some(diff)
-  })
+  Ok(if diff.is_empty() { None } else { Some(diff) })
 }
 
 fn extract_files_from_regex_blocks(
@@ -1062,14 +1128,13 @@ async fn test_specifiers(
     specifiers
   };
 
-  let (sender, receiver) = unbounded_channel::<TestEvent>();
-  let sender = TestEventSender::new(sender);
+  let (test_event_sender_factory, receiver) = create_test_event_channel();
   let concurrent_jobs = options.concurrent_jobs;
 
-  let sender_ = sender.downgrade();
+  let mut cancel_sender = test_event_sender_factory.weak_sender();
   let sigint_handler_handle = spawn(async move {
     signal::ctrl_c().await.unwrap();
-    sender_.upgrade().map(|s| s.send(TestEvent::Sigint).ok());
+    cancel_sender.send(TestEvent::Sigint).ok();
   });
   HAS_TEST_RUN_SIGINT_HANDLER.store(true, Ordering::Relaxed);
   let reporter = get_test_reporter(&options);
@@ -1078,7 +1143,7 @@ async fn test_specifiers(
   let join_handles = specifiers.into_iter().map(move |specifier| {
     let worker_factory = worker_factory.clone();
     let permissions = permissions.clone();
-    let sender = sender.clone();
+    let worker_sender = test_event_sender_factory.worker();
     let fail_fast_tracker = fail_fast_tracker.clone();
     let specifier_options = options.specifier.clone();
     spawn_blocking(move || {
@@ -1086,12 +1151,13 @@ async fn test_specifiers(
         worker_factory,
         permissions,
         specifier,
-        sender.clone(),
+        worker_sender,
         fail_fast_tracker,
         specifier_options,
       ))
     })
   });
+
   let join_stream = stream::iter(join_handles)
     .buffer_unordered(concurrent_jobs.get())
     .collect::<Vec<Result<Result<(), AnyError>, tokio::task::JoinError>>>();
@@ -1111,9 +1177,9 @@ async fn test_specifiers(
 
 /// Gives receiver back in case it was ended with `TestEvent::ForceEndReport`.
 pub async fn report_tests(
-  mut receiver: UnboundedReceiver<TestEvent>,
+  mut receiver: TestEventReceiver,
   mut reporter: Box<dyn TestReporter>,
-) -> (Result<(), AnyError>, UnboundedReceiver<TestEvent>) {
+) -> (Result<(), AnyError>, TestEventReceiver) {
   let mut tests = IndexMap::new();
   let mut test_steps = IndexMap::new();
   let mut tests_started = HashSet::new();
@@ -1123,11 +1189,14 @@ pub async fn report_tests(
   let mut used_only = false;
   let mut failed = false;
 
-  while let Some(event) = receiver.recv().await {
+  while let Some((_, event)) = receiver.recv().await {
     match event {
       TestEvent::Register(description) => {
-        reporter.report_register(&description);
-        tests.insert(description.id, description);
+        for (_, description) in description.into_iter() {
+          reporter.report_register(description);
+          // TODO(mmastrac): We shouldn't need to clone here -- we can reuse the descriptions everywhere
+          tests.insert(description.id, description.clone());
+        }
       }
       TestEvent::Plan(plan) => {
         if !had_plan {
@@ -1144,7 +1213,7 @@ pub async fn report_tests(
           reporter.report_wait(tests.get(&id).unwrap());
         }
       }
-      TestEvent::Output(output) => {
+      TestEvent::Output(_, output) => {
         reporter.report_output(&output);
       }
       TestEvent::Result(id, result, elapsed) => {
@@ -1490,7 +1559,7 @@ pub async fn run_tests_with_watch(
         let graph_kind = cli_options.type_check_mode().as_graph_kind();
         let log_level = cli_options.log_level();
         let cli_options = cli_options.clone();
-        let module_graph_builder = factory.module_graph_builder().await?;
+        let module_graph_creator = factory.module_graph_creator().await?;
         let file_fetcher = factory.file_fetcher()?;
         let test_modules = if test_options.doc {
           collect_specifiers(test_options.files.clone(), |p, _| {
@@ -1505,7 +1574,7 @@ pub async fn run_tests_with_watch(
 
         let permissions =
           Permissions::from_options(&cli_options.permissions_options())?;
-        let graph = module_graph_builder
+        let graph = module_graph_creator
           .create_graph(graph_kind, test_modules.clone())
           .await?;
         graph_valid_with_cli_options(
@@ -1627,158 +1696,6 @@ impl FailFastTracker {
       false
     }
   }
-}
-
-#[derive(Clone)]
-pub struct TestEventSender {
-  sender: UnboundedSender<TestEvent>,
-  stdout_writer: TestOutputPipe,
-  stderr_writer: TestOutputPipe,
-}
-
-impl TestEventSender {
-  pub fn new(sender: UnboundedSender<TestEvent>) -> Self {
-    Self {
-      stdout_writer: TestOutputPipe::new(sender.clone()),
-      stderr_writer: TestOutputPipe::new(sender.clone()),
-      sender,
-    }
-  }
-
-  pub fn stdout(&self) -> std::fs::File {
-    self.stdout_writer.as_file()
-  }
-
-  pub fn stderr(&self) -> std::fs::File {
-    self.stderr_writer.as_file()
-  }
-
-  pub fn send(&mut self, message: TestEvent) -> Result<(), AnyError> {
-    // for any event that finishes collecting output, we need to
-    // ensure that the collected stdout and stderr pipes are flushed
-    if matches!(
-      message,
-      TestEvent::Result(_, _, _)
-        | TestEvent::StepWait(_)
-        | TestEvent::StepResult(_, _, _)
-        | TestEvent::UncaughtError(_, _)
-    ) {
-      self.flush_stdout_and_stderr()?;
-    }
-
-    self.sender.send(message)?;
-    Ok(())
-  }
-
-  fn downgrade(&self) -> WeakUnboundedSender<TestEvent> {
-    self.sender.downgrade()
-  }
-
-  fn flush_stdout_and_stderr(&mut self) -> Result<(), AnyError> {
-    self.stdout_writer.flush()?;
-    self.stderr_writer.flush()?;
-
-    Ok(())
-  }
-}
-
-// use a string that if it ends up in the output won't affect how things are displayed
-const ZERO_WIDTH_SPACE: &str = "\u{200B}";
-
-struct TestOutputPipe {
-  writer: os_pipe::PipeWriter,
-  state: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
-}
-
-impl Clone for TestOutputPipe {
-  fn clone(&self) -> Self {
-    Self {
-      writer: self.writer.try_clone().unwrap(),
-      state: self.state.clone(),
-    }
-  }
-}
-
-impl TestOutputPipe {
-  pub fn new(sender: UnboundedSender<TestEvent>) -> Self {
-    let (reader, writer) = os_pipe::pipe().unwrap();
-    let state = Arc::new(Mutex::new(None));
-
-    start_output_redirect_thread(reader, sender, state.clone());
-
-    Self { writer, state }
-  }
-
-  pub fn flush(&mut self) -> Result<(), AnyError> {
-    // We want to wake up the other thread and have it respond back
-    // that it's done clearing out its pipe before returning.
-    let (sender, receiver) = std::sync::mpsc::channel();
-    if let Some(sender) = self.state.lock().replace(sender) {
-      let _ = sender.send(()); // just in case
-    }
-    // Bit of a hack to send a zero width space in order to wake
-    // the thread up. It seems that sending zero bytes here does
-    // not work on windows.
-    self.writer.write_all(ZERO_WIDTH_SPACE.as_bytes())?;
-    self.writer.flush()?;
-    // ignore the error as it might have been picked up and closed
-    let _ = receiver.recv();
-
-    Ok(())
-  }
-
-  pub fn as_file(&self) -> std::fs::File {
-    pipe_writer_to_file(self.writer.try_clone().unwrap())
-  }
-}
-
-#[cfg(windows)]
-fn pipe_writer_to_file(writer: os_pipe::PipeWriter) -> std::fs::File {
-  use std::os::windows::prelude::FromRawHandle;
-  use std::os::windows::prelude::IntoRawHandle;
-  // SAFETY: Requires consuming ownership of the provided handle
-  unsafe { std::fs::File::from_raw_handle(writer.into_raw_handle()) }
-}
-
-#[cfg(unix)]
-fn pipe_writer_to_file(writer: os_pipe::PipeWriter) -> std::fs::File {
-  use std::os::unix::io::FromRawFd;
-  use std::os::unix::io::IntoRawFd;
-  // SAFETY: Requires consuming ownership of the provided handle
-  unsafe { std::fs::File::from_raw_fd(writer.into_raw_fd()) }
-}
-
-fn start_output_redirect_thread(
-  mut pipe_reader: os_pipe::PipeReader,
-  sender: UnboundedSender<TestEvent>,
-  flush_state: Arc<Mutex<Option<std::sync::mpsc::Sender<()>>>>,
-) {
-  spawn_blocking(move || loop {
-    let mut buffer = [0; 512];
-    let size = match pipe_reader.read(&mut buffer) {
-      Ok(0) | Err(_) => break,
-      Ok(size) => size,
-    };
-    let oneshot_sender = flush_state.lock().take();
-    let mut data = &buffer[0..size];
-    if data.ends_with(ZERO_WIDTH_SPACE.as_bytes()) {
-      data = &data[0..data.len() - ZERO_WIDTH_SPACE.len()];
-    }
-
-    if !data.is_empty()
-      && sender
-        .send(TestEvent::Output(buffer[0..size].to_vec()))
-        .is_err()
-    {
-      break;
-    }
-
-    // Always respond back if this was set. Ideally we would also check to
-    // ensure the pipe reader is empty before sending back this response.
-    if let Some(sender) = oneshot_sender {
-      let _ignore = sender.send(());
-    }
-  });
 }
 
 #[cfg(test)]

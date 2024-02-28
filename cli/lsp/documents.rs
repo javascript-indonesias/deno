@@ -51,7 +51,6 @@ use deno_runtime::permissions::PermissionsContainer;
 use deno_semver::npm::NpmPackageReqReference;
 use deno_semver::package::PackageReq;
 use indexmap::IndexMap;
-use lsp::Url;
 use once_cell::sync::Lazy;
 use package_json::PackageJsonDepsProvider;
 use std::borrow::Cow;
@@ -1102,24 +1101,28 @@ impl Documents {
     &self,
     specifier: &'a ModuleSpecifier,
   ) -> SloppyImportsResolution<'a> {
-    SloppyImportsResolver::resolve_with_stat_sync(specifier, |path| {
-      if let Ok(specifier) = ModuleSpecifier::from_file_path(path) {
-        if self.open_docs.contains_key(&specifier)
-          || self.cache.contains(&specifier)
-        {
-          return Some(SloppyImportsFsEntry::File);
+    SloppyImportsResolver::resolve_with_stat_sync(
+      specifier,
+      ResolutionMode::Types,
+      |path| {
+        if let Ok(specifier) = ModuleSpecifier::from_file_path(path) {
+          if self.open_docs.contains_key(&specifier)
+            || self.cache.contains(&specifier)
+          {
+            return Some(SloppyImportsFsEntry::File);
+          }
         }
-      }
-      path.metadata().ok().and_then(|m| {
-        if m.is_file() {
-          Some(SloppyImportsFsEntry::File)
-        } else if m.is_dir() {
-          Some(SloppyImportsFsEntry::Dir)
-        } else {
-          None
-        }
-      })
-    })
+        path.metadata().ok().and_then(|m| {
+          if m.is_file() {
+            Some(SloppyImportsFsEntry::File)
+          } else if m.is_dir() {
+            Some(SloppyImportsFsEntry::Dir)
+          } else {
+            None
+          }
+        })
+      },
+    )
   }
 
   /// Return `true` if the specifier can be resolved to a document.
@@ -1333,6 +1336,10 @@ impl Documents {
     Ok(())
   }
 
+  pub fn get_jsr_resolver(&self) -> &Arc<JsrResolver> {
+    &self.jsr_resolver
+  }
+
   pub fn refresh_jsr_resolver(
     &mut self,
     lockfile: Option<Arc<Mutex<Lockfile>>>,
@@ -1417,7 +1424,7 @@ impl Documents {
       options.document_preload_limit,
       options.maybe_import_map.as_deref(),
       maybe_jsx_config.as_ref(),
-      options.maybe_config_file.and_then(|c| c.vendor_dir_flag()),
+      options.maybe_config_file.and_then(|c| c.json.vendor),
       maybe_package_json_deps.as_ref(),
       options.maybe_config_file.map(|c| &c.json.unstable),
     );
@@ -1797,30 +1804,30 @@ impl<'a> OpenDocumentsGraphLoader<'a> {
     &self,
     specifier: &'b ModuleSpecifier,
   ) -> SloppyImportsResolution<'b> {
-    SloppyImportsResolver::resolve_with_stat_sync(specifier, |path| {
-      if let Ok(specifier) = ModuleSpecifier::from_file_path(path) {
-        if self.open_docs.contains_key(&specifier) {
-          return Some(SloppyImportsFsEntry::File);
+    SloppyImportsResolver::resolve_with_stat_sync(
+      specifier,
+      ResolutionMode::Types,
+      |path| {
+        if let Ok(specifier) = ModuleSpecifier::from_file_path(path) {
+          if self.open_docs.contains_key(&specifier) {
+            return Some(SloppyImportsFsEntry::File);
+          }
         }
-      }
-      path.metadata().ok().and_then(|m| {
-        if m.is_file() {
-          Some(SloppyImportsFsEntry::File)
-        } else if m.is_dir() {
-          Some(SloppyImportsFsEntry::Dir)
-        } else {
-          None
-        }
-      })
-    })
+        path.metadata().ok().and_then(|m| {
+          if m.is_file() {
+            Some(SloppyImportsFsEntry::File)
+          } else if m.is_dir() {
+            Some(SloppyImportsFsEntry::Dir)
+          } else {
+            None
+          }
+        })
+      },
+    )
   }
 }
 
 impl<'a> deno_graph::source::Loader for OpenDocumentsGraphLoader<'a> {
-  fn registry_url(&self) -> &Url {
-    self.inner_loader.registry_url()
-  }
-
   fn load(
     &mut self,
     specifier: &ModuleSpecifier,
