@@ -50,6 +50,7 @@ mod auth;
 mod diagnostics;
 mod graph;
 mod paths;
+mod pm;
 mod provenance;
 mod publish_order;
 mod tar;
@@ -57,6 +58,7 @@ mod unfurl;
 
 use auth::get_auth_method;
 use auth::AuthMethod;
+pub use pm::add;
 use publish_order::PublishOrderGraph;
 pub use unfurl::deno_json_deps;
 use unfurl::SpecifierUnfurler;
@@ -597,7 +599,7 @@ async fn publish_package(
       if task.status == "success" {
         println!(
           "{} @{}/{}@{}",
-          colors::green("Skipping, already published"),
+          colors::yellow("Warning: Skipping, already published"),
           package.scope,
           package.package,
           package.version
@@ -665,8 +667,12 @@ async fn publish_package(
     package.version
   );
 
-  if provenance {
-    // Get the version manifest from JSR
+  let enable_provenance = std::env::var("DISABLE_JSR_PROVENANCE").is_err()
+    && (auth::is_gha() && auth::gha_oidc_token().is_some() && provenance);
+
+  // Enable provenance by default on Github actions with OIDC token
+  if enable_provenance {
+    // Get the version manifest from the registry
     let meta_url = jsr_url().join(&format!(
       "@{}/{}/{}_meta.json",
       package.scope, package.package, package.version
@@ -942,7 +948,7 @@ pub async fn publish(
     prepared_data.publish_order_graph,
     prepared_data.package_by_name,
     auth_method,
-    publish_flags.provenance,
+    !publish_flags.no_provenance,
   )
   .await?;
 
