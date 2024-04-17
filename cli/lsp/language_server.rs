@@ -4,7 +4,6 @@ use base64::Engine;
 use deno_ast::MediaType;
 use deno_core::anyhow::anyhow;
 use deno_core::error::AnyError;
-use deno_core::parking_lot::Mutex;
 use deno_core::resolve_url;
 use deno_core::serde_json;
 use deno_core::serde_json::json;
@@ -14,7 +13,6 @@ use deno_core::url;
 use deno_core::ModuleSpecifier;
 use deno_graph::GraphKind;
 use deno_graph::Resolution;
-use deno_lockfile::Lockfile;
 use deno_npm::NpmSystemInfo;
 use deno_runtime::deno_fs;
 use deno_runtime::deno_node::NodeResolver;
@@ -54,6 +52,7 @@ use super::client::Client;
 use super::code_lens;
 use super::completions;
 use super::config::Config;
+use super::config::ConfigData;
 use super::config::ConfigSnapshot;
 use super::config::UpdateImportsOnFileMoveEnabled;
 use super::config::WorkspaceSettings;
@@ -85,6 +84,7 @@ use super::text;
 use super::tsc;
 use super::tsc::Assets;
 use super::tsc::AssetsSnapshot;
+use super::tsc::ChangeKind;
 use super::tsc::GetCompletionDetailsArgs;
 use super::tsc::TsServer;
 use super::urls;
@@ -92,7 +92,6 @@ use crate::args::get_root_cert_store;
 use crate::args::CaData;
 use crate::args::CacheSetting;
 use crate::args::CliOptions;
-use crate::args::ConfigFile;
 use crate::args::Flags;
 use crate::cache::DenoDir;
 use crate::cache::FastInsecureHasher;
@@ -152,10 +151,9 @@ struct LspNpmConfigHash(u64);
 impl LspNpmConfigHash {
   pub fn from_inner(inner: &Inner) -> Self {
     let config_data = inner.config.tree.root_data();
-    let node_modules_dir = config_data
-      .as_ref()
-      .and_then(|d| d.node_modules_dir.as_ref());
-    let lockfile = config_data.as_ref().and_then(|d| d.lockfile.as_ref());
+    let node_modules_dir =
+      config_data.and_then(|d| d.node_modules_dir.as_ref());
+    let lockfile = config_data.and_then(|d| d.lockfile.as_ref());
     let mut hasher = FastInsecureHasher::new();
     hasher.write_hashable(node_modules_dir);
     hasher.write_hashable(&inner.maybe_global_cache_path);
@@ -178,6 +176,7 @@ pub struct StateNpmSnapshot {
 /// Snapshot of the state used by TSC.
 #[derive(Clone, Debug)]
 pub struct StateSnapshot {
+  pub project_version: usize,
   pub assets: AssetsSnapshot,
   pub cache_metadata: cache::CacheMetadata,
   pub config: Arc<ConfigSnapshot>,
@@ -256,6 +255,7 @@ pub struct Inner {
   maybe_testing_server: Option<testing::TestServer>,
   /// Services used for dealing with npm related functionality.
   npm: LspNpmServices,
+  project_version: usize,
   /// A collection of measurements which instrument that performance of the LSP.
   performance: Arc<Performance>,
   /// A memoized version of fixable diagnostic codes retrieved from TypeScript.
@@ -289,7 +289,7 @@ impl LanguageServer {
     async fn create_graph_for_caching(
       cli_options: CliOptions,
       roots: Vec<ModuleSpecifier>,
-      open_docs: Vec<Document>,
+      open_docs: Vec<Arc<Document>>,
     ) -> Result<(), AnyError> {
       let open_docs = open_docs
         .into_iter()
@@ -367,7 +367,7 @@ impl LanguageServer {
       {
         let mut inner = self.0.write().await;
         let lockfile = inner.config.tree.root_lockfile().cloned();
-        inner.documents.refresh_jsr_resolver(lockfile);
+        inner.documents.refresh_lockfile(lockfile);
         inner.refresh_npm_specifiers().await;
       }
       // now refresh the data in a read
@@ -539,6 +539,7 @@ impl Inner {
       initial_cwd: initial_cwd.clone(),
       jsr_search_api,
       maybe_global_cache_path: None,
+      project_version: 0,
       task_queue: Default::default(),
       maybe_testing_server: None,
       module_registries,
@@ -671,6 +672,7 @@ impl Inner {
         }
       });
     Arc::new(StateSnapshot {
+      project_version: self.project_version,
       assets: self.assets.snapshot(),
       cache_metadata: self.cache_metadata.clone(),
       config: self.config.snapshot(),
@@ -792,11 +794,7 @@ impl Inner {
       &deno_dir,
       &self.initial_cwd,
       &self.http_client,
-      config_data.as_ref().and_then(|d| d.config_file.as_deref()),
-      config_data.as_ref().and_then(|d| d.lockfile.as_ref()),
-      config_data
-        .as_ref()
-        .and_then(|d| d.node_modules_dir.clone()),
+      config_data,
     )
     .await;
     let node_resolver = Arc::new(NodeResolver::new(
@@ -854,16 +852,10 @@ async fn create_npm_resolver(
   deno_dir: &DenoDir,
   initial_cwd: &Path,
   http_client: &Arc<HttpClient>,
-  maybe_config_file: Option<&ConfigFile>,
-  maybe_lockfile: Option<&Arc<Mutex<Lockfile>>>,
-  maybe_node_modules_dir_path: Option<PathBuf>,
+  config_data: Option<&ConfigData>,
 ) -> Arc<dyn CliNpmResolver> {
-  let is_byonm = std::env::var("DENO_UNSTABLE_BYONM").as_deref() == Ok("1")
-    || maybe_config_file
-      .as_ref()
-      .map(|c| c.has_unstable("byonm"))
-      .unwrap_or(false);
-  create_cli_npm_resolver_for_lsp(if is_byonm {
+  let byonm = config_data.map(|d| d.byonm).unwrap_or(false);
+  create_cli_npm_resolver_for_lsp(if byonm {
     CliNpmResolverCreateOptions::Byonm(CliNpmResolverByonmCreateOptions {
       fs: Arc::new(deno_fs::RealFs),
       root_node_modules_dir: initial_cwd.join("node_modules"),
@@ -871,7 +863,7 @@ async fn create_npm_resolver(
   } else {
     CliNpmResolverCreateOptions::Managed(CliNpmResolverManagedCreateOptions {
       http_client: http_client.clone(),
-      snapshot: match maybe_lockfile {
+      snapshot: match config_data.and_then(|d| d.lockfile.as_ref()) {
         Some(lockfile) => {
           CliNpmResolverManagedSnapshotOption::ResolveFromLockfile(
             lockfile.clone(),
@@ -890,7 +882,8 @@ async fn create_npm_resolver(
       // the user is typing.
       cache_setting: CacheSetting::Only,
       text_only_progress_bar: ProgressBar::new(ProgressBarStyle::TextOnly),
-      maybe_node_modules_path: maybe_node_modules_dir_path,
+      maybe_node_modules_path: config_data
+        .and_then(|d| d.node_modules_dir.clone()),
       // do not install while resolving in the lsp—leave that to the cache command
       package_json_installer:
         CliNpmResolverManagedPackageJsonInstallerOption::NoInstall,
@@ -982,9 +975,14 @@ impl Inner {
       self.config.update_capabilities(&params.capabilities);
     }
 
-    self
+    if let Err(e) = self
       .ts_server
-      .start(self.config.internal_inspect().to_address());
+      .start(self.config.internal_inspect().to_address())
+    {
+      lsp_warn!("{}", e);
+      self.client.show_message(MessageType::ERROR, e);
+      return Err(tower_lsp::jsonrpc::Error::internal_error());
+    };
 
     self.update_debug_flag();
     self.refresh_workspace_files();
@@ -1195,17 +1193,19 @@ impl Inner {
     // refresh the npm specifiers because it might have discovered
     // a @types/node package and now's a good time to do that anyway
     self.refresh_npm_specifiers().await;
+
+    self.project_changed(&[], true).await;
   }
 
   fn shutdown(&self) -> LspResult<()> {
     Ok(())
   }
 
-  fn did_open(
+  async fn did_open(
     &mut self,
     specifier: &ModuleSpecifier,
     params: DidOpenTextDocumentParams,
-  ) -> Document {
+  ) -> Arc<Document> {
     let mark = self.performance.mark_with_args("lsp.did_open", &params);
     let language_id =
       params
@@ -1229,6 +1229,9 @@ impl Inner {
       params.text_document.language_id.parse().unwrap(),
       params.text_document.text.into(),
     );
+    self
+      .project_changed(&[(document.specifier(), ChangeKind::Opened)], false)
+      .await;
 
     self.performance.measure(mark);
     document
@@ -1246,10 +1249,14 @@ impl Inner {
     ) {
       Ok(document) => {
         if document.is_diagnosable() {
-          self.refresh_npm_specifiers().await;
           self
-            .diagnostics_server
-            .invalidate(&self.documents.dependents(&specifier));
+            .project_changed(
+              &[(document.specifier(), ChangeKind::Modified)],
+              false,
+            )
+            .await;
+          self.refresh_npm_specifiers().await;
+          self.diagnostics_server.invalidate(&[specifier]);
           self.send_diagnostics_update();
           self.send_testing_update();
         }
@@ -1291,15 +1298,16 @@ impl Inner {
       .normalize_url(&params.text_document.uri, LspUrlKind::File);
     if self.is_diagnosable(&specifier) {
       self.refresh_npm_specifiers().await;
-      let mut specifiers = self.documents.dependents(&specifier);
-      specifiers.push(specifier.clone());
-      self.diagnostics_server.invalidate(&specifiers);
+      self.diagnostics_server.invalidate(&[specifier.clone()]);
       self.send_diagnostics_update();
       self.send_testing_update();
     }
     if let Err(err) = self.documents.close(&specifier) {
       error!("{:#}", err);
     }
+    self
+      .project_changed(&[(&specifier, ChangeKind::Closed)], false)
+      .await;
     self.performance.measure(mark);
   }
 
@@ -2985,6 +2993,18 @@ impl Inner {
     Ok(maybe_symbol_information)
   }
 
+  async fn project_changed(
+    &mut self,
+    modified_scripts: &[(&ModuleSpecifier, ChangeKind)],
+    config_changed: bool,
+  ) {
+    self.project_version += 1; // increment before getting the snapshot
+    self
+      .ts_server
+      .project_changed(self.snapshot(), modified_scripts, config_changed)
+      .await;
+  }
+
   fn send_diagnostics_update(&self) {
     let snapshot = DiagnosticServerUpdateMessage {
       snapshot: self.snapshot(),
@@ -3190,11 +3210,10 @@ impl tower_lsp::LanguageServer for LanguageServer {
     let specifier = inner
       .url_map
       .normalize_url(&params.text_document.uri, LspUrlKind::File);
-    let document = inner.did_open(&specifier, params);
+    let document = inner.did_open(&specifier, params).await;
     if document.is_diagnosable() {
       inner.refresh_npm_specifiers().await;
-      let specifiers = inner.documents.dependents(&specifier);
-      inner.diagnostics_server.invalidate(&specifiers);
+      inner.diagnostics_server.invalidate(&[specifier]);
       inner.send_diagnostics_update();
       inner.send_testing_update();
     }
@@ -3464,7 +3483,7 @@ impl tower_lsp::LanguageServer for LanguageServer {
 struct PrepareCacheResult {
   cli_options: CliOptions,
   roots: Vec<ModuleSpecifier>,
-  open_docs: Vec<Document>,
+  open_docs: Vec<Arc<Document>>,
   mark: PerformanceMark,
 }
 
