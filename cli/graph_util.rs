@@ -18,9 +18,9 @@ use crate::tools::check;
 use crate::tools::check::TypeChecker;
 use crate::util::file_watcher::WatcherCommunicator;
 use crate::util::fs::canonicalize_path;
-use crate::util::path::specifier_to_file_path;
 use crate::util::sync::TaskQueue;
 use crate::util::sync::TaskQueuePermit;
+use deno_runtime::fs_util::specifier_to_file_path;
 
 use deno_config::WorkspaceMemberConfig;
 use deno_core::anyhow::bail;
@@ -451,16 +451,17 @@ impl ModuleGraphBuilder {
         options.roots,
         loader.as_mut_loader(),
         deno_graph::BuildOptions {
-          is_dynamic: options.is_dynamic,
-          jsr_url_provider: &CliJsrUrlProvider,
-          executor: Default::default(),
           imports: maybe_imports,
-          resolver: Some(graph_resolver),
+          is_dynamic: options.is_dynamic,
+          passthrough_jsr_specifiers: false,
+          workspace_members: &workspace_members,
+          executor: Default::default(),
           file_system: &DenoGraphFsAdapter(self.fs.as_ref()),
+          jsr_url_provider: &CliJsrUrlProvider,
           npm_resolver: Some(graph_npm_resolver),
           module_analyzer: &analyzer,
           reporter: maybe_file_watcher_reporter,
-          workspace_members: &workspace_members,
+          resolver: Some(graph_resolver),
         },
       )
       .await

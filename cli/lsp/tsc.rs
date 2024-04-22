@@ -30,8 +30,8 @@ use crate::tsc;
 use crate::tsc::ResolveArgs;
 use crate::tsc::MISSING_DEPENDENCY_SPECIFIER;
 use crate::util::path::relative_specifier;
-use crate::util::path::specifier_to_file_path;
 use crate::util::path::to_percent_decoded_str;
+use deno_runtime::fs_util::specifier_to_file_path;
 
 use dashmap::DashMap;
 use deno_ast::MediaType;
@@ -356,6 +356,21 @@ impl TsServer {
     Ok(diagnostics_map)
   }
 
+  pub async fn cleanup_semantic_cache(&self, snapshot: Arc<StateSnapshot>) {
+    let req = TscRequest {
+      method: "cleanupSemanticCache",
+      args: json!([]),
+    };
+    self
+      .request::<()>(snapshot, req)
+      .await
+      .map_err(|err| {
+        log::error!("Failed to request to tsserver {}", err);
+        LspError::invalid_request()
+      })
+      .ok();
+  }
+
   pub async fn find_references(
     &self,
     snapshot: Arc<StateSnapshot>,
@@ -475,8 +490,14 @@ impl TsServer {
     specifier: ModuleSpecifier,
     range: Range<u32>,
     preferences: Option<UserPreferences>,
+    trigger_kind: Option<lsp::CodeActionTriggerKind>,
     only: String,
   ) -> Result<Vec<ApplicableRefactorInfo>, LspError> {
+    let trigger_kind: Option<&str> = trigger_kind.map(|reason| match reason {
+      lsp::CodeActionTriggerKind::INVOKED => "invoked",
+      lsp::CodeActionTriggerKind::AUTOMATIC => "implicit",
+      _ => unreachable!(),
+    });
     let req = TscRequest {
       method: "getApplicableRefactors",
       // https://github.com/denoland/deno/blob/v1.37.1/cli/tsc/dts/typescript.d.ts#L6274
@@ -484,7 +505,7 @@ impl TsServer {
         self.specifier_map.denormalize(&specifier),
         { "pos": range.start, "end": range.end },
         preferences.unwrap_or_default(),
-        json!(null),
+        trigger_kind,
         only,
       ]),
     };
@@ -1008,14 +1029,6 @@ impl TsServer {
       log::error!("Unable to get inlay hints: {}", err);
       LspError::internal_error()
     })
-  }
-
-  pub async fn restart(&self, snapshot: Arc<StateSnapshot>) {
-    let req = TscRequest {
-      method: "$restart",
-      args: json!([]),
-    };
-    self.request::<bool>(snapshot, req).await.unwrap();
   }
 
   async fn request<R>(
@@ -4032,13 +4045,29 @@ fn op_load<'s>(
   Ok(serialized)
 }
 
+#[op2(fast)]
+fn op_release(
+  state: &mut OpState,
+  #[string] specifier: &str,
+) -> Result<(), AnyError> {
+  let state = state.borrow_mut::<State>();
+  let mark = state
+    .performance
+    .mark_with_args("tsc.op.op_release", specifier);
+  let specifier = state.specifier_map.normalize(specifier)?;
+  state.state_snapshot.documents.release(&specifier);
+  state.performance.measure(mark);
+  Ok(())
+}
+
 #[op2]
 #[serde]
 fn op_resolve(
   state: &mut OpState,
-  #[serde] args: ResolveArgs,
+  #[string] base: String,
+  #[serde] specifiers: Vec<String>,
 ) -> Result<Vec<Option<(String, String)>>, AnyError> {
-  op_resolve_inner(state, args)
+  op_resolve_inner(state, ResolveArgs { base, specifiers })
 }
 
 #[inline]
@@ -4244,6 +4273,7 @@ deno_core::extension!(deno_tsc,
     op_is_cancelled,
     op_is_node_file,
     op_load,
+    op_release,
     op_resolve,
     op_respond,
     op_script_names,

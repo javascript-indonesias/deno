@@ -155,6 +155,12 @@ delete Object.prototype.__proto__;
   /** @type {Map<string, ts.SourceFile>} */
   const sourceFileCache = new Map();
 
+  /** @type {Map<string, string>} */
+  const sourceTextCache = new Map();
+
+  /** @type {Map<string, number>} */
+  const sourceRefCounts = new Map();
+
   /** @type {string[]=} */
   let scriptFileNamesCache;
 
@@ -171,6 +177,8 @@ delete Object.prototype.__proto__;
 
   /** @type {number | null} */
   let projectVersionCache = null;
+
+  let lastRequestMethod = null;
 
   const ChangeKind = {
     Opened: 0,
@@ -250,6 +258,8 @@ delete Object.prototype.__proto__;
         );
         documentRegistrySourceFileCache.set(mapKey, sourceFile);
       }
+      const sourceRefCount = sourceRefCounts.get(fileName) ?? 0;
+      sourceRefCounts.set(fileName, sourceRefCount + 1);
       return sourceFile;
     },
 
@@ -333,8 +343,20 @@ delete Object.prototype.__proto__;
     },
 
     releaseDocumentWithKey(path, key, _scriptKind, _impliedNodeFormat) {
-      const mapKey = path + key;
-      documentRegistrySourceFileCache.delete(mapKey);
+      const sourceRefCount = sourceRefCounts.get(path) ?? 1;
+      if (sourceRefCount <= 1) {
+        sourceRefCounts.delete(path);
+        // We call `cleanupSemanticCache` for other purposes, don't bust the
+        // source cache in this case.
+        if (lastRequestMethod != "cleanupSemanticCache") {
+          const mapKey = path + key;
+          documentRegistrySourceFileCache.delete(mapKey);
+          sourceTextCache.delete(path);
+          ops.op_release(path);
+        }
+      } else {
+        sourceRefCounts.set(path, sourceRefCount - 1);
+      }
     },
 
     reportStats() {
@@ -659,7 +681,8 @@ delete Object.prototype.__proto__;
         debug(`host.writeFile("${fileName}")`);
       }
       return ops.op_emit(
-        { fileName, data },
+        data,
+        fileName,
       );
     },
     getCurrentDirectory() {
@@ -695,10 +718,10 @@ delete Object.prototype.__proto__;
           : arg;
         if (fileReference.fileName.startsWith("npm:")) {
           /** @type {[string, ts.Extension] | undefined} */
-          const resolved = ops.op_resolve({
-            specifiers: [fileReference.fileName],
-            base: containingFilePath,
-          })?.[0];
+          const resolved = ops.op_resolve(
+            containingFilePath,
+            [fileReference.fileName],
+          )?.[0];
           if (resolved) {
             isCjsCache.maybeAdd(resolved);
             return {
@@ -728,10 +751,10 @@ delete Object.prototype.__proto__;
         debug(`  specifiers: ${specifiers.join(", ")}`);
       }
       /** @type {Array<[string, ts.Extension] | undefined>} */
-      const resolved = ops.op_resolve({
-        specifiers,
+      const resolved = ops.op_resolve(
         base,
-      });
+        specifiers,
+      );
       if (resolved) {
         const result = resolved.map((item) => {
           if (item) {
@@ -807,19 +830,26 @@ delete Object.prototype.__proto__;
       if (logDebug) {
         debug(`host.getScriptSnapshot("${specifier}")`);
       }
-      let sourceFile = sourceFileCache.get(specifier);
-      if (!sourceFile) {
-        sourceFile = this.getSourceFile(
-          specifier,
-          specifier.endsWith(".json")
-            ? ts.ScriptTarget.JSON
-            : ts.ScriptTarget.ESNext,
-        );
-      }
+      const sourceFile = sourceFileCache.get(specifier);
       if (sourceFile) {
+        // This case only occurs for assets.
         return ts.ScriptSnapshot.fromString(sourceFile.text);
       }
-      return undefined;
+      let sourceText = sourceTextCache.get(specifier);
+      if (sourceText == undefined) {
+        /** @type {{ data: string, version: string, isCjs: boolean }} */
+        const fileInfo = ops.op_load(specifier);
+        if (!fileInfo) {
+          return undefined;
+        }
+        if (fileInfo.isCjs) {
+          isCjsCache.add(specifier);
+        }
+        sourceTextCache.set(specifier, fileInfo.data);
+        scriptVersionCache.set(specifier, fileInfo.version);
+        sourceText = fileInfo.data;
+      }
+      return ts.ScriptSnapshot.fromString(sourceText);
     },
   };
 
@@ -1047,6 +1077,7 @@ delete Object.prototype.__proto__;
     if (logDebug) {
       debug(`serverRequest()`, id, method, args);
     }
+    lastRequestMethod = method;
     switch (method) {
       case "$projectChanged": {
         /** @type {[string, number][]} */
@@ -1058,6 +1089,7 @@ delete Object.prototype.__proto__;
 
         if (configChanged) {
           tsConfigCache = null;
+          isNodeSourceFileCache.clear();
         }
 
         projectVersionCache = newProjectVersion;
@@ -1068,7 +1100,7 @@ delete Object.prototype.__proto__;
             opened = true;
           }
           scriptVersionCache.delete(script);
-          sourceFileCache.delete(script);
+          sourceTextCache.delete(script);
         }
 
         if (configChanged || opened) {
@@ -1076,10 +1108,6 @@ delete Object.prototype.__proto__;
         }
 
         return respond(id);
-      }
-      case "$restart": {
-        serverRestart();
-        return respond(id, true);
       }
       case "$getSupportedCodeFixes": {
         return respond(
@@ -1150,12 +1178,6 @@ delete Object.prototype.__proto__;
     languageService = ts.createLanguageService(host, documentRegistry);
     setLogDebug(debugFlag, "TSLS");
     debug("serverInit()");
-  }
-
-  function serverRestart() {
-    languageService = ts.createLanguageService(host, documentRegistry);
-    isNodeSourceFileCache.clear();
-    debug("serverRestart()");
   }
 
   // A build time only op that provides some setup information that is used to

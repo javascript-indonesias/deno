@@ -120,10 +120,10 @@ use crate::tools::upgrade::check_for_upgrades_for_lsp;
 use crate::tools::upgrade::upgrade_check_enabled;
 use crate::util::fs::remove_dir_all_if_exists;
 use crate::util::path::is_importable_ext;
-use crate::util::path::specifier_to_file_path;
 use crate::util::path::to_percent_decoded_str;
 use crate::util::progress_bar::ProgressBar;
 use crate::util::progress_bar::ProgressBarStyle;
+use deno_runtime::fs_util::specifier_to_file_path;
 
 struct LspRootCertStoreProvider(RootCertStore);
 
@@ -364,14 +364,11 @@ impl LanguageServer {
           .client
           .show_message(MessageType::WARNING, err);
       }
-      {
-        let mut inner = self.0.write().await;
-        let lockfile = inner.config.tree.root_lockfile().cloned();
-        inner.documents.refresh_lockfile(lockfile);
-        inner.refresh_npm_specifiers().await;
-      }
-      // now refresh the data in a read
-      self.0.read().await.post_cache(result.mark).await;
+      let mut inner = self.0.write().await;
+      let lockfile = inner.config.tree.root_lockfile().cloned();
+      inner.documents.refresh_lockfile(lockfile);
+      inner.refresh_npm_specifiers().await;
+      inner.post_cache(result.mark).await;
     }
     Ok(Some(json!(true)))
   }
@@ -407,8 +404,11 @@ impl LanguageServer {
     let inner = self.0.read().await;
     if let Some(testing_server) = &inner.maybe_testing_server {
       match params.map(serde_json::from_value) {
-        Some(Ok(params)) => testing_server
-          .run_request(params, inner.config.workspace_settings().clone()),
+        Some(Ok(params)) => {
+          testing_server
+            .run_request(params, inner.config.workspace_settings().clone())
+            .await
+        }
         Some(Err(err)) => Err(LspError::invalid_params(err.to_string())),
         None => Err(LspError::invalid_params("Missing parameters")),
       }
@@ -975,6 +975,8 @@ impl Inner {
       self.config.update_capabilities(&params.capabilities);
     }
 
+    self.documents.initialize(&self.config);
+
     if let Err(e) = self
       .ts_server
       .start(self.config.internal_inspect().to_address())
@@ -1421,7 +1423,16 @@ impl Inner {
       self.recreate_npm_services_if_necessary().await;
       self.refresh_documents_config().await;
       self.diagnostics_server.invalidate_all();
-      self.ts_server.restart(self.snapshot()).await;
+      self
+        .project_changed(
+          &changes
+            .iter()
+            .map(|(s, _)| (s, ChangeKind::Modified))
+            .collect::<Vec<_>>(),
+          false,
+        )
+        .await;
+      self.ts_server.cleanup_semantic_cache(self.snapshot()).await;
       self.send_diagnostics_update();
       self.send_testing_update();
     }
@@ -1604,10 +1615,9 @@ impl Inner {
     let hover = if let Some((_, dep, range)) = asset_or_doc
       .get_maybe_dependency(&params.text_document_position_params.position)
     {
-      let dep_maybe_types_dependency = dep
-        .get_code()
-        .and_then(|s| self.documents.get(s))
-        .map(|d| d.maybe_types_dependency());
+      let dep_doc = dep.get_code().and_then(|s| self.documents.get(s));
+      let dep_maybe_types_dependency =
+        dep_doc.as_ref().map(|d| d.maybe_types_dependency());
       let value = match (dep.maybe_code.is_none(), dep.maybe_type.is_none(), &dep_maybe_types_dependency) {
         (false, false, None) => format!(
           "**Resolved Dependency**\n\n**Code**: {}\n\n**Types**: {}\n",
@@ -1869,6 +1879,7 @@ impl Inner {
           &self.config,
           &specifier,
         )),
+        params.context.trigger_kind,
         only,
       )
       .await?;
@@ -3544,13 +3555,14 @@ impl Inner {
     }))
   }
 
-  async fn post_cache(&self, mark: PerformanceMark) {
+  async fn post_cache(&mut self, mark: PerformanceMark) {
     // Now that we have dependencies loaded, we need to re-analyze all the files.
     // For that we're invalidating all the existing diagnostics and restarting
     // the language server for TypeScript (as it might hold to some stale
     // documents).
     self.diagnostics_server.invalidate_all();
-    self.ts_server.restart(self.snapshot()).await;
+    self.project_changed(&[], false).await;
+    self.ts_server.cleanup_semantic_cache(self.snapshot()).await;
     self.send_diagnostics_update();
     self.send_testing_update();
 
