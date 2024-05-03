@@ -190,7 +190,7 @@ async function ensureNoNewITests() {
     "bench_tests.rs": 0,
     "bundle_tests.rs": 12,
     "cache_tests.rs": 0,
-    "cert_tests.rs": 3,
+    "cert_tests.rs": 0,
     "check_tests.rs": 23,
     "compile_tests.rs": 0,
     "coverage_tests.rs": 0,
@@ -221,7 +221,7 @@ async function ensureNoNewITests() {
     "upgrade_tests.rs": 0,
     "vendor_tests.rs": 1,
     "watcher_tests.rs": 0,
-    "worker_tests.rs": 23,
+    "worker_tests.rs": 18,
   };
   const integrationDir = join(ROOT_PATH, "tests", "integration");
   for await (const entry of Deno.readDir(integrationDir)) {
