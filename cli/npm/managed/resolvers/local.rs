@@ -17,6 +17,7 @@ use crate::cache::CACHE_PERM;
 use crate::npm::cache_dir::mixed_case_package_name_decode;
 use crate::util::fs::atomic_write_file;
 use crate::util::fs::canonicalize_path_maybe_not_exists_with_fs;
+use crate::util::fs::clone_dir_recursive;
 use crate::util::fs::symlink_dir;
 use crate::util::fs::LaxSingleProcessFsFlag;
 use crate::util::progress_bar::ProgressBar;
@@ -44,8 +45,6 @@ use serde::Deserialize;
 use serde::Serialize;
 
 use crate::npm::cache_dir::mixed_case_package_name_encode;
-use crate::util::fs::copy_dir_recursive;
-use crate::util::fs::hard_link_dir_recursive;
 
 use super::super::super::common::types_package_name;
 use super::super::cache::NpmCache;
@@ -293,7 +292,7 @@ async fn sync_resolution_with_fs(
     Vec::with_capacity(package_partitions.packages.len());
   let mut newest_packages_by_name: HashMap<&String, &NpmResolutionPackage> =
     HashMap::with_capacity(package_partitions.packages.len());
-  let bin_entries_to_setup = Arc::new(Mutex::new(Vec::with_capacity(16)));
+  let bin_entries = Arc::new(Mutex::new(bin_entries::BinEntries::new()));
   for package in &package_partitions.packages {
     if let Some(current_pkg) =
       newest_packages_by_name.get_mut(&package.id.nv.name)
@@ -321,7 +320,7 @@ async fn sync_resolution_with_fs(
       let pb = progress_bar.clone();
       let cache = cache.clone();
       let package = package.clone();
-      let bin_entries_to_setup = bin_entries_to_setup.clone();
+      let bin_entries_to_setup = bin_entries.clone();
       let handle = spawn(async move {
         cache.ensure_package(&package.id.nv, &package.dist).await?;
         let pb_guard = pb.update_with_prompt(
@@ -331,23 +330,25 @@ async fn sync_resolution_with_fs(
         let sub_node_modules = folder_path.join("node_modules");
         let package_path =
           join_package_name(&sub_node_modules, &package.id.nv.name);
-        fs::create_dir_all(&package_path)
-          .with_context(|| format!("Creating '{}'", folder_path.display()))?;
         let cache_folder =
           cache.package_folder_for_name_and_version(&package.id.nv);
-        if hard_link_dir_recursive(&cache_folder, &package_path).is_err() {
-          // Fallback to copying the directory.
-          //
-          // Also handles EXDEV when when trying to hard link across volumes.
-          copy_dir_recursive(&cache_folder, &package_path)?;
-        }
-        // write out a file that indicates this folder has been initialized
-        fs::write(initialized_file, "")?;
+
+        deno_core::unsync::spawn_blocking({
+          let package_path = package_path.clone();
+          move || {
+            clone_dir_recursive(&cache_folder, &package_path)?;
+            // write out a file that indicates this folder has been initialized
+            fs::write(initialized_file, "")?;
+
+            Ok::<_, AnyError>(())
+          }
+        })
+        .await??;
 
         if package.bin.is_some() {
           bin_entries_to_setup
             .lock()
-            .push((package.clone(), package_path));
+            .add(package.clone(), package_path);
         }
 
         // finally stop showing the progress bar
@@ -373,9 +374,7 @@ async fn sync_resolution_with_fs(
       let sub_node_modules = destination_path.join("node_modules");
       let package_path =
         join_package_name(&sub_node_modules, &package.id.nv.name);
-      fs::create_dir_all(&package_path).with_context(|| {
-        format!("Creating '{}'", destination_path.display())
-      })?;
+
       let source_path = join_package_name(
         &deno_local_registry_dir
           .join(get_package_folder_id_folder_name(
@@ -384,7 +383,8 @@ async fn sync_resolution_with_fs(
           .join("node_modules"),
         &package.id.nv.name,
       );
-      hard_link_dir_recursive(&source_path, &package_path)?;
+
+      clone_dir_recursive(&source_path, &package_path)?;
       // write out a file that indicates this folder has been initialized
       fs::write(initialized_file, "")?;
     }
@@ -482,46 +482,8 @@ async fn sync_resolution_with_fs(
 
   // 6. Set up `node_modules/.bin` entries for packages that need it.
   {
-    let bin_entries = bin_entries_to_setup.lock();
-    if !bin_entries.is_empty() && !bin_node_modules_dir_path.exists() {
-      fs::create_dir_all(&bin_node_modules_dir_path).with_context(|| {
-        format!("Creating '{}'", bin_node_modules_dir_path.display())
-      })?;
-    }
-    for (package, package_path) in &*bin_entries {
-      let package = snapshot.package_from_id(&package.id).unwrap();
-      if let Some(bin_entries) = &package.bin {
-        match bin_entries {
-          deno_npm::registry::NpmPackageVersionBinEntry::String(script) => {
-            // the default bin name doesn't include the organization
-            let name = package
-              .id
-              .nv
-              .name
-              .rsplit_once('/')
-              .map_or(package.id.nv.name.as_str(), |(_, name)| name);
-            bin_entries::set_up_bin_entry(
-              package,
-              name,
-              script,
-              package_path,
-              &bin_node_modules_dir_path,
-            )?;
-          }
-          deno_npm::registry::NpmPackageVersionBinEntry::Map(entries) => {
-            for (name, script) in entries {
-              bin_entries::set_up_bin_entry(
-                package,
-                name,
-                script,
-                package_path,
-                &bin_node_modules_dir_path,
-              )?;
-            }
-          }
-        }
-      }
-    }
+    let bin_entries = std::mem::take(&mut *bin_entries.lock());
+    bin_entries.finish(snapshot, &bin_node_modules_dir_path)?;
   }
 
   setup_cache.save();
