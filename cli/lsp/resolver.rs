@@ -1,9 +1,10 @@
 // Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
 
 use crate::args::create_default_npmrc;
-use crate::args::package_json;
 use crate::args::CacheSetting;
 use crate::args::CliLockfile;
+use crate::args::PackageJsonInstallDepsProvider;
+use crate::args::DENO_FUTURE;
 use crate::graph_util::CliJsrUrlProvider;
 use crate::http_util::HttpClientProvider;
 use crate::lsp::config::Config;
@@ -16,6 +17,7 @@ use crate::npm::CliNpmResolverCreateOptions;
 use crate::npm::CliNpmResolverManagedCreateOptions;
 use crate::npm::CliNpmResolverManagedSnapshotOption;
 use crate::npm::ManagedCliNpmResolver;
+use crate::resolver::CjsResolutionStore;
 use crate::resolver::CliGraphResolver;
 use crate::resolver::CliGraphResolverOptions;
 use crate::resolver::CliNodeResolver;
@@ -26,16 +28,19 @@ use crate::util::progress_bar::ProgressBarStyle;
 use dashmap::DashMap;
 use deno_ast::MediaType;
 use deno_cache_dir::HttpCache;
-use deno_core::error::AnyError;
+use deno_config::workspace::PackageJsonDepResolution;
+use deno_config::workspace::WorkspaceResolver;
 use deno_core::url::Url;
 use deno_graph::source::Resolver;
 use deno_graph::GraphImport;
 use deno_graph::ModuleSpecifier;
 use deno_npm::NpmSystemInfo;
 use deno_runtime::deno_fs;
+use deno_runtime::deno_node::errors::ClosestPkgJsonError;
 use deno_runtime::deno_node::NodeResolution;
 use deno_runtime::deno_node::NodeResolutionMode;
 use deno_runtime::deno_node::NodeResolver;
+use deno_runtime::deno_node::NpmResolver;
 use deno_runtime::deno_node::PackageJson;
 use deno_runtime::fs_util::specifier_to_file_path;
 use deno_semver::jsr::JsrPackageReqReference;
@@ -43,7 +48,6 @@ use deno_semver::npm::NpmPackageReqReference;
 use deno_semver::package::PackageNv;
 use deno_semver::package::PackageReq;
 use indexmap::IndexMap;
-use package_json::PackageJsonDepsProvider;
 use std::borrow::Cow;
 use std::collections::BTreeMap;
 use std::collections::BTreeSet;
@@ -114,7 +118,7 @@ impl LspScopeResolver {
     let npm_graph_resolver = graph_resolver.create_graph_npm_resolver();
     let graph_imports = config_data
       .and_then(|d| d.config_file.as_ref())
-      .and_then(|cf| cf.to_maybe_imports().ok())
+      .and_then(|cf| cf.to_compiler_option_types().ok())
       .map(|imports| {
         Arc::new(
           imports
@@ -342,11 +346,29 @@ impl LspResolver {
   }
 
   pub fn in_node_modules(&self, specifier: &ModuleSpecifier) -> bool {
-    let resolver = self.get_scope_resolver(Some(specifier));
-    if let Some(npm_resolver) = &resolver.npm_resolver {
-      return npm_resolver.in_npm_package(specifier);
+    fn has_node_modules_dir(specifier: &ModuleSpecifier) -> bool {
+      // consider any /node_modules/ directory as being in the node_modules
+      // folder for the LSP because it's pretty complicated to deal with multiple scopes
+      specifier.scheme() == "file"
+        && specifier
+          .path()
+          .to_ascii_lowercase()
+          .contains("/node_modules/")
     }
-    false
+
+    let global_npm_resolver = self
+      .get_scope_resolver(Some(specifier))
+      .npm_resolver
+      .as_ref()
+      .and_then(|npm_resolver| npm_resolver.as_managed())
+      .filter(|r| r.root_node_modules_path().is_none());
+    if let Some(npm_resolver) = &global_npm_resolver {
+      if npm_resolver.in_npm_package(specifier) {
+        return true;
+      }
+    }
+
+    has_node_modules_dir(specifier)
   }
 
   pub fn node_media_type(
@@ -364,7 +386,7 @@ impl LspResolver {
   pub fn get_closest_package_json(
     &self,
     referrer: &ModuleSpecifier,
-  ) -> Result<Option<Arc<PackageJson>>, AnyError> {
+  ) -> Result<Option<Arc<PackageJson>>, ClosestPkgJsonError> {
     let resolver = self.get_scope_resolver(Some(referrer));
     let Some(node_resolver) = resolver.node_resolver.as_ref() else {
       return Ok(None);
@@ -421,20 +443,17 @@ async fn create_npm_resolver(
   cache: &LspCache,
   http_client_provider: &Arc<HttpClientProvider>,
 ) -> Option<Arc<dyn CliNpmResolver>> {
-  let mut byonm_dir = None;
-  if let Some(config_data) = config_data {
-    if config_data.byonm {
-      byonm_dir = Some(config_data.node_modules_dir.clone().or_else(|| {
-        specifier_to_file_path(&config_data.scope)
-          .ok()
-          .map(|p| p.join("node_modules/"))
-      })?)
-    }
-  }
-  let options = if let Some(byonm_dir) = byonm_dir {
+  let enable_byonm = config_data.map(|d| d.byonm).unwrap_or(*DENO_FUTURE);
+  let options = if enable_byonm {
     CliNpmResolverCreateOptions::Byonm(CliNpmResolverByonmCreateOptions {
       fs: Arc::new(deno_fs::RealFs),
-      root_node_modules_dir: byonm_dir,
+      root_node_modules_dir: config_data.and_then(|config_data| {
+        config_data.node_modules_dir.clone().or_else(|| {
+          specifier_to_file_path(&config_data.scope)
+            .ok()
+            .map(|p| p.join("node_modules/"))
+        })
+      }),
     })
   } else {
     CliNpmResolverCreateOptions::Managed(CliNpmResolverManagedCreateOptions {
@@ -460,17 +479,15 @@ async fn create_npm_resolver(
       text_only_progress_bar: ProgressBar::new(ProgressBarStyle::TextOnly),
       maybe_node_modules_path: config_data
         .and_then(|d| d.node_modules_dir.clone()),
-      package_json_deps_provider: Arc::new(PackageJsonDepsProvider::new(
-        config_data
-          .and_then(|d| d.package_json.as_ref())
-          .map(|package_json| {
-            package_json.resolve_local_package_json_version_reqs()
-          }),
-      )),
+      // only used for top level install, so we can ignore this
+      package_json_deps_provider: Arc::new(
+        PackageJsonInstallDepsProvider::empty(),
+      ),
       npmrc: config_data
         .and_then(|d| d.npmrc.clone())
         .unwrap_or_else(create_default_npmrc),
       npm_system_info: NpmSystemInfo::default(),
+      lifecycle_scripts: Default::default(),
     })
   };
   Some(create_cli_npm_resolver_for_lsp(options).await)
@@ -479,6 +496,13 @@ async fn create_npm_resolver(
 fn create_node_resolver(
   npm_resolver: Option<&Arc<dyn CliNpmResolver>>,
 ) -> Option<Arc<CliNodeResolver>> {
+  use once_cell::sync::Lazy;
+
+  // it's not ideal to share this across all scopes and to
+  // never clear it, but it's fine for the time being
+  static CJS_RESOLUTIONS: Lazy<Arc<CjsResolutionStore>> =
+    Lazy::new(Default::default);
+
   let npm_resolver = npm_resolver?;
   let fs = Arc::new(deno_fs::RealFs);
   let node_resolver_inner = Arc::new(NodeResolver::new(
@@ -486,7 +510,7 @@ fn create_node_resolver(
     npm_resolver.clone().into_npm_resolver(),
   ));
   Some(Arc::new(CliNodeResolver::new(
-    None,
+    CJS_RESOLUTIONS.clone(),
     fs,
     node_resolver_inner,
     npm_resolver.clone(),
@@ -504,16 +528,22 @@ fn create_graph_resolver(
   Arc::new(CliGraphResolver::new(CliGraphResolverOptions {
     node_resolver: node_resolver.cloned(),
     npm_resolver: npm_resolver.cloned(),
-    package_json_deps_provider: Arc::new(PackageJsonDepsProvider::new(
+    workspace_resolver: Arc::new(WorkspaceResolver::new_raw(
+      config_data.and_then(|d| d.import_map.as_ref().map(|i| (**i).clone())),
       config_data
-        .and_then(|d| d.package_json.as_ref())
-        .map(|package_json| {
-          package_json.resolve_local_package_json_version_reqs()
-        }),
+        .and_then(|d| d.package_json.clone())
+        .into_iter()
+        .collect(),
+      if config_data.map(|d| d.byonm).unwrap_or(false) {
+        PackageJsonDepResolution::Disabled
+      } else {
+        // todo(dsherret): this should also be disabled for when using
+        // auto-install with a node_modules directory
+        PackageJsonDepResolution::Enabled
+      },
     )),
     maybe_jsx_import_source_config: config_file
       .and_then(|cf| cf.to_maybe_jsx_import_source_config().ok().flatten()),
-    maybe_import_map: config_data.and_then(|d| d.import_map.clone()),
     maybe_vendor_dir: config_data.and_then(|d| d.vendor_dir.as_ref()),
     bare_node_builtins_enabled: config_file
       .map(|cf| cf.has_unstable("bare-node-builtins"))
