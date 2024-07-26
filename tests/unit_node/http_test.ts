@@ -7,9 +7,9 @@ import https from "node:https";
 import net from "node:net";
 import fs from "node:fs";
 
-import { assert, assertEquals, fail } from "@std/assert/mod.ts";
-import { assertSpyCalls, spy } from "@std/testing/mock.ts";
-import { fromFileUrl, relative } from "@std/path/mod.ts";
+import { assert, assertEquals, fail } from "@std/assert";
+import { assertSpyCalls, spy } from "@std/testing/mock";
+import { fromFileUrl, relative } from "@std/path";
 
 import { gzip } from "node:zlib";
 import { Buffer } from "node:buffer";
@@ -846,7 +846,10 @@ Deno.test(
   "[node/http] client upgrade",
   { permissions: { net: true } },
   async () => {
-    const { promise, resolve } = Promise.withResolvers<void>();
+    const { promise: serverClosed, resolve: resolveServer } = Promise
+      .withResolvers<void>();
+    const { promise: socketClosed, resolve: resolveSocket } = Promise
+      .withResolvers<void>();
     const server = http.createServer((req, res) => {
       // @ts-ignore: It exists on TLSSocket
       assert(!req.socket.encrypted);
@@ -887,12 +890,16 @@ Deno.test(
         // @ts-ignore it's a socket for real
         serverSocket!.end();
         server.close(() => {
-          resolve();
+          resolveServer();
+        });
+        socket.on("close", () => {
+          resolveSocket();
         });
       });
     });
 
-    await promise;
+    await serverClosed;
+    await socketClosed;
   },
 );
 
