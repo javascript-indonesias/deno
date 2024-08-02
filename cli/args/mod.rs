@@ -202,6 +202,7 @@ pub fn ts_config_to_transpile_and_emit_options(
       inline_sources: options.inline_sources,
       remove_comments: false,
       source_map,
+      source_map_base: None,
       source_map_file: None,
     },
   ))
@@ -623,6 +624,8 @@ pub enum RootCertStoreLoadError {
   UnknownStore(String),
   #[error("Unable to add pem file to certificate store: {0}")]
   FailedAddPemFile(String),
+  #[error("Unable to add system certificate to certificate store: {0}")]
+  FailedAddSystemCert(String),
   #[error("Failed opening CA file: {0}")]
   CaFileOpenError(String),
 }
@@ -658,7 +661,9 @@ pub fn get_root_cert_store(
         for root in roots {
           root_cert_store
             .add(rustls::pki_types::CertificateDer::from(root.0))
-            .expect("Failed to add platform cert to root cert store");
+            .map_err(|e| {
+              RootCertStoreLoadError::FailedAddSystemCert(e.to_string())
+            })?;
         }
       }
       _ => {
