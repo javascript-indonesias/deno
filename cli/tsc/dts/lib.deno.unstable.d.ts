@@ -856,7 +856,7 @@ declare namespace Deno {
    *
    * These are unstable options which can be used with {@linkcode Deno.run}.
    *
-   * @category Sub Process
+   * @category Subprocess
    * @experimental
    */
   export interface UnstableRunOptions extends RunOptions {
@@ -919,7 +919,7 @@ declare namespace Deno {
    * Requires `allow-run` permission.
    *
    * @tags allow-run
-   * @category Sub Process
+   * @category Subprocess
    * @experimental
    */
   export function run<T extends UnstableRunOptions = UnstableRunOptions>(
@@ -960,7 +960,7 @@ declare namespace Deno {
     caCerts?: string[];
     /** A HTTP proxy to use for new connections. */
     proxy?: Proxy;
-    /** Sets the maximum numer of idle connections per host allowed in the pool. */
+    /** Sets the maximum number of idle connections per host allowed in the pool. */
     poolMaxIdlePerHost?: number;
     /** Set an optional timeout for idle sockets being kept-alive.
      * Set to false to disable the timeout. */
