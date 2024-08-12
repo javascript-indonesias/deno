@@ -281,6 +281,7 @@ impl BenchOptions {
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Hash)]
 pub struct UnstableFmtOptions {
+  pub css: bool,
   pub yaml: bool,
 }
 
@@ -314,6 +315,7 @@ impl FmtOptions {
     Self {
       options: resolve_fmt_options(fmt_flags, fmt_config.options),
       unstable: UnstableFmtOptions {
+        css: unstable.css || fmt_flags.unstable_css,
         yaml: unstable.yaml || fmt_flags.unstable_yaml,
       },
       files: fmt_config.files,
@@ -1330,8 +1332,10 @@ impl CliOptions {
   }
 
   pub fn resolve_config_unstable_fmt_options(&self) -> UnstableFmtOptions {
+    let workspace = self.workspace();
     UnstableFmtOptions {
-      yaml: self.workspace().has_unstable("fmt-yaml"),
+      css: workspace.has_unstable("fmt-css"),
+      yaml: workspace.has_unstable("fmt-yaml"),
     }
   }
 
@@ -1664,6 +1668,7 @@ impl CliOptions {
         "sloppy-imports",
         "byonm",
         "bare-node-builtins",
+        "fmt-css",
         "fmt-yaml",
       ]);
       // add more unstable flags to the same vector holding granular flags
@@ -1885,7 +1890,7 @@ fn load_env_variables_from_env_file(filename: Option<&String>) {
     Err(error) => {
       match error {
           dotenvy::Error::LineParse(line, index)=> log::info!("{} Parsing failed within the specified environment file: {} at index: {} of the value: {}",colors::yellow("Warning"), env_file_name, index, line),
-          dotenvy::Error::Io(_)=> log::info!("{} The `--env` flag was used, but the environment file specified '{}' was not found.",colors::yellow("Warning"),env_file_name),
+          dotenvy::Error::Io(_)=> log::info!("{} The `--env-file` flag was used, but the environment file specified '{}' was not found.",colors::yellow("Warning"),env_file_name),
           dotenvy::Error::EnvVar(_)=> log::info!("{} One or more of the environment variables isn't present or not unicode within the specified environment file: {}",colors::yellow("Warning"),env_file_name),
           _ => log::info!("{} Unknown failure occurred with the specified environment file: {}", colors::yellow("Warning"), env_file_name),
         }
