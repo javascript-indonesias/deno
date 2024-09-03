@@ -38,7 +38,6 @@ util::unit_test_factory!(
     file_test,
     filereader_test,
     files_test,
-    flock_test,
     fs_events_test,
     get_random_values_test,
     globals_test,
@@ -78,7 +77,6 @@ util::unit_test_factory!(
     remove_test,
     rename_test,
     request_test,
-    resources_test,
     response_test,
     serve_test,
     signal_test,
@@ -117,10 +115,6 @@ util::unit_test_factory!(
 );
 
 fn js_unit_test(test: String) {
-  js_unit_test_inner(test, false);
-}
-
-pub fn js_unit_test_inner(test: String, future: bool) {
   let _g = util::http_server();
 
   let deno = util::deno_cmd()
@@ -132,12 +126,6 @@ pub fn js_unit_test_inner(test: String, future: bool) {
     .arg("--unstable")
     .arg("--location=http://127.0.0.1:4545/")
     .arg("--no-prompt");
-
-  let deno = if future {
-    deno.env("DENO_FUTURE", "1")
-  } else {
-    deno
-  };
 
   // TODO(mmastrac): it would be better to just load a test CA for all tests
   let deno = if test == "websocket_test" || test == "tls_sni_test" {
