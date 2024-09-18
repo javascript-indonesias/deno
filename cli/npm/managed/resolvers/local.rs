@@ -10,6 +10,7 @@ use std::cmp::Ordering;
 use std::collections::hash_map::Entry;
 use std::collections::BTreeMap;
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 use std::path::PathBuf;
@@ -18,6 +19,7 @@ use std::sync::Arc;
 
 use crate::args::LifecycleScriptsConfig;
 use crate::args::PackagesAllowedScripts;
+use crate::colors;
 use async_trait::async_trait;
 use deno_ast::ModuleSpecifier;
 use deno_core::anyhow;
@@ -25,6 +27,7 @@ use deno_core::anyhow::Context;
 use deno_core::error::AnyError;
 use deno_core::futures::stream::FuturesUnordered;
 use deno_core::futures::StreamExt;
+use deno_core::parking_lot::Mutex;
 use deno_core::url::Url;
 use deno_npm::resolution::NpmResolutionSnapshot;
 use deno_npm::NpmPackageCacheFolderId;
@@ -460,6 +463,7 @@ async fn sync_resolution_with_fs(
   let bin_entries = Rc::new(RefCell::new(bin_entries::BinEntries::new()));
   let mut packages_with_scripts = Vec::with_capacity(2);
   let mut packages_with_scripts_not_run = Vec::new();
+  let packages_with_deprecation_warnings = Arc::new(Mutex::new(Vec::new()));
   for package in &package_partitions.packages {
     if let Some(current_pkg) =
       newest_packages_by_name.get_mut(&package.id.nv.name)
@@ -486,6 +490,8 @@ async fn sync_resolution_with_fs(
 
       let folder_path = folder_path.clone();
       let bin_entries_to_setup = bin_entries.clone();
+      let packages_with_deprecation_warnings =
+        packages_with_deprecation_warnings.clone();
       cache_futures.push(async move {
         tarball_cache
           .ensure_package(&package.id.nv, &package.dist)
@@ -518,12 +524,9 @@ async fn sync_resolution_with_fs(
         }
 
         if let Some(deprecated) = &package.deprecated {
-          log::info!(
-            "{} {:?} is deprecated: {}",
-            crate::colors::yellow("Warning"),
-            package.id,
-            crate::colors::gray(deprecated),
-          );
+          packages_with_deprecation_warnings
+            .lock()
+            .push((package.id.clone(), deprecated.clone()));
         }
 
         // finally stop showing the progress bar
@@ -620,6 +623,9 @@ async fn sync_resolution_with_fs(
 
   let mut found_names: HashMap<&String, &PackageNv> = HashMap::new();
 
+  // set of node_modules in workspace packages that we've already ensured exist
+  let mut existing_child_node_modules_dirs: HashSet<PathBuf> = HashSet::new();
+
   // 4. Create symlinks for package json dependencies
   {
     for remote in npm_install_deps_provider.remote_pkgs() {
@@ -638,13 +644,16 @@ async fn sync_resolution_with_fs(
       } else {
         continue; // skip, package not found
       };
-      let alias_clashes = remote.req.name != remote.alias
-        && newest_packages_by_name.contains_key(&remote.alias);
+      let Some(remote_alias) = &remote.alias else {
+        continue;
+      };
+      let alias_clashes = remote.req.name != *remote_alias
+        && newest_packages_by_name.contains_key(remote_alias);
       let install_in_child = {
         // we'll install in the child if the alias is taken by another package, or
         // if there's already a package with the same name but different version
         // linked into the root
-        match found_names.entry(&remote.alias) {
+        match found_names.entry(remote_alias) {
           Entry::Occupied(nv) => {
             alias_clashes
               || remote.req.name != nv.get().name // alias to a different package (in case of duplicate aliases)
@@ -667,8 +676,15 @@ async fn sync_resolution_with_fs(
       );
       if install_in_child {
         // symlink the dep into the package's child node_modules folder
-        let dest_path =
-          remote.base_dir.join("node_modules").join(&remote.alias);
+        let dest_node_modules = remote.base_dir.join("node_modules");
+        if !existing_child_node_modules_dirs.contains(&dest_node_modules) {
+          fs::create_dir_all(&dest_node_modules).with_context(|| {
+            format!("Creating '{}'", dest_node_modules.display())
+          })?;
+          existing_child_node_modules_dirs.insert(dest_node_modules.clone());
+        }
+        let mut dest_path = dest_node_modules;
+        dest_path.push(remote_alias);
 
         symlink_package_dir(&local_registry_package_path, &dest_path)?;
       } else {
@@ -678,7 +694,7 @@ async fn sync_resolution_with_fs(
         {
           symlink_package_dir(
             &local_registry_package_path,
-            &join_package_name(root_node_modules_dir_path, &remote.alias),
+            &join_package_name(root_node_modules_dir_path, remote_alias),
           )?;
         }
       }
@@ -763,9 +779,12 @@ async fn sync_resolution_with_fs(
     // install correctly for a workspace (potentially in sub directories),
     // but this is good enough for a first pass
     for workspace in npm_install_deps_provider.workspace_pkgs() {
+      let Some(workspace_alias) = &workspace.alias else {
+        continue;
+      };
       symlink_package_dir(
         &workspace.target_dir,
-        &root_node_modules_dir_path.join(&workspace.alias),
+        &root_node_modules_dir_path.join(workspace_alias),
       )?;
     }
   }
@@ -832,15 +851,59 @@ async fn sync_resolution_with_fs(
     }
   }
 
+  {
+    let packages_with_deprecation_warnings =
+      packages_with_deprecation_warnings.lock();
+    if !packages_with_deprecation_warnings.is_empty() {
+      log::warn!(
+        "{} Following packages are deprecated:",
+        colors::yellow("Warning")
+      );
+      let len = packages_with_deprecation_warnings.len();
+      for (idx, (package_id, msg)) in
+        packages_with_deprecation_warnings.iter().enumerate()
+      {
+        if idx != len - 1 {
+          log::warn!(
+            "┠─ {}",
+            colors::gray(format!("npm:{:?} ({})", package_id, msg))
+          );
+        } else {
+          log::warn!(
+            "┗─ {}",
+            colors::gray(format!("npm:{:?} ({})", package_id, msg))
+          );
+        }
+      }
+    }
+  }
+
   if !packages_with_scripts_not_run.is_empty() {
-    let packages = packages_with_scripts_not_run
+    log::warn!("{} Following packages contained npm lifecycle scripts ({}) that were not executed:", colors::yellow("Warning"), colors::gray("preinstall/install/postinstall"));
+
+    for (_, package_nv) in packages_with_scripts_not_run.iter() {
+      log::warn!("┠─ {}", colors::gray(format!("npm:{package_nv}")));
+    }
+
+    log::warn!("┃");
+    log::warn!(
+      "┠─ {}",
+      colors::italic("This may cause the packages to not work correctly.")
+    );
+    log::warn!("┗─ {}", colors::italic("To run lifecycle scripts, use the `--allow-scripts` flag with `deno install`:"));
+    let packages_comma_separated = packages_with_scripts_not_run
       .iter()
       .map(|(_, p)| format!("npm:{p}"))
       .collect::<Vec<_>>()
-      .join(", ");
-    log::warn!("{} Packages contained npm lifecycle scripts (preinstall/install/postinstall) that were not executed.
-    This may cause the packages to not work correctly. To run them, use the `--allow-scripts` flag with `deno cache` or `deno install`
-    (e.g. `deno cache --allow-scripts=pkg1,pkg2 <entrypoint>` or `deno install --allow-scripts=pkg1,pkg2`):\n      {packages}", crate::colors::yellow("Warning"));
+      .join(",");
+    log::warn!(
+      "   {}",
+      colors::bold(format!(
+        "deno install --allow-scripts={}",
+        packages_comma_separated
+      ))
+    );
+
     for (scripts_warned_path, _) in packages_with_scripts_not_run {
       let _ignore_err = fs::write(scripts_warned_path, "");
     }

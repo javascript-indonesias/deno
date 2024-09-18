@@ -11,7 +11,6 @@ use super::tsc;
 use super::tsc::AssetDocument;
 
 use crate::graph_util::CliJsrUrlProvider;
-use deno_runtime::fs_util::specifier_to_file_path;
 
 use dashmap::DashMap;
 use deno_ast::swc::visit::VisitWith;
@@ -28,6 +27,7 @@ use deno_core::ModuleSpecifier;
 use deno_graph::source::ResolutionMode;
 use deno_graph::Resolution;
 use deno_runtime::deno_node;
+use deno_runtime::fs_util::specifier_to_file_path;
 use deno_semver::jsr::JsrPackageReqReference;
 use deno_semver::npm::NpmPackageReqReference;
 use deno_semver::package::PackageReq;
@@ -1524,12 +1524,16 @@ impl<'a> deno_graph::source::Loader for OpenDocumentsGraphLoader<'a> {
   fn cache_module_info(
     &self,
     specifier: &deno_ast::ModuleSpecifier,
+    media_type: MediaType,
     source: &Arc<[u8]>,
     module_info: &deno_graph::ModuleInfo,
   ) {
-    self
-      .inner_loader
-      .cache_module_info(specifier, source, module_info)
+    self.inner_loader.cache_module_info(
+      specifier,
+      media_type,
+      source,
+      module_info,
+    )
   }
 }
 

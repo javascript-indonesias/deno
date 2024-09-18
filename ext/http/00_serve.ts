@@ -511,9 +511,15 @@ function mapToCallback(context, callback, onError) {
         );
       }
 
+      if (response.type === "error") {
+        throw new TypeError(
+          "Return value from serve handler must not be an error response (like Response.error())",
+        );
+      }
+
       if (response.bodyUsed) {
         throw new TypeError(
-          "The body of the Response returned from the serve handler has already been consumed.",
+          "The body of the Response returned from the serve handler has already been consumed",
         );
       }
     } catch (error) {
@@ -583,7 +589,7 @@ type RawServeOptions = {
 
 const kLoadBalanced = Symbol("kLoadBalanced");
 
-function mapAnyAddrToLocalhostForWindows(hostname: string) {
+function formatHostName(hostname: string): string {
   // If the hostname is "0.0.0.0", we display "localhost" in console
   // because browsers in Windows don't resolve "0.0.0.0".
   // See the discussion in https://github.com/denoland/deno_std/issues/1165
@@ -593,7 +599,9 @@ function mapAnyAddrToLocalhostForWindows(hostname: string) {
   ) {
     return "localhost";
   }
-  return hostname;
+
+  // Add brackets around ipv6 hostname
+  return StringPrototypeIncludes(hostname, ":") ? `[${hostname}]` : hostname;
 }
 
 function serve(arg1, arg2) {
@@ -644,7 +652,7 @@ function serve(arg1, arg2) {
         options.onListen(listener.addr);
       } else {
         // deno-lint-ignore no-console
-        console.log(`Listening on ${path}`);
+        console.error(`Listening on ${path}`);
       }
     });
   }
@@ -690,12 +698,10 @@ function serve(arg1, arg2) {
     if (options.onListen) {
       options.onListen(addr);
     } else {
-      const hostname = mapAnyAddrToLocalhostForWindows(addr.hostname);
-      const host = StringPrototypeIncludes(hostname, ":")
-        ? `[${hostname}]`
-        : hostname;
+      const host = formatHostName(addr.hostname);
+
       // deno-lint-ignore no-console
-      console.log(`Listening on ${scheme}${host}:${addr.port}/`);
+      console.error(`Listening on ${scheme}${host}:${addr.port}/`);
     }
   };
 
@@ -868,10 +874,11 @@ function registerDeclarativeServer(exports) {
             const nThreads = serveWorkerCount > 1
               ? ` with ${serveWorkerCount} threads`
               : "";
-            const hostname_ = mapAnyAddrToLocalhostForWindows(hostname);
+            const host = formatHostName(hostname);
+
             // deno-lint-ignore no-console
-            console.debug(
-              `%cdeno serve%c: Listening on %chttp://${hostname_}:${port}/%c${nThreads}`,
+            console.error(
+              `%cdeno serve%c: Listening on %chttp://${host}:${port}/%c${nThreads}`,
               "color: green",
               "color: inherit",
               "color: yellow",
@@ -879,8 +886,8 @@ function registerDeclarativeServer(exports) {
             );
           }
         },
-        handler: (req) => {
-          return exports.fetch(req);
+        handler: (req, connInfo) => {
+          return exports.fetch(req, connInfo);
         },
       });
     };
