@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -23,14 +23,11 @@ use deno_runtime::deno_fs;
 use deno_runtime::deno_node::NodeExtInitServices;
 use deno_runtime::deno_node::NodeRequireLoader;
 use deno_runtime::deno_node::NodeRequireLoaderRc;
-use deno_runtime::deno_node::NodeResolver;
-use deno_runtime::deno_node::PackageJsonResolver;
 use deno_runtime::deno_permissions::PermissionsContainer;
 use deno_runtime::deno_tls::RootCertStoreProvider;
 use deno_runtime::deno_web::BlobStore;
 use deno_runtime::fmt_errors::format_js_error;
 use deno_runtime::inspector_server::InspectorServer;
-use deno_runtime::ops::otel::OtelConfig;
 use deno_runtime::ops::process::NpmProcessStateProviderRc;
 use deno_runtime::ops::worker_host::CreateWebWorkerCb;
 use deno_runtime::web_worker::WebWorker;
@@ -43,16 +40,21 @@ use deno_runtime::BootstrapOptions;
 use deno_runtime::WorkerExecutionMode;
 use deno_runtime::WorkerLogLevel;
 use deno_semver::npm::NpmPackageReqReference;
+use deno_telemetry::OtelConfig;
 use deno_terminal::colors;
-use node_resolver::NodeModuleKind;
-use node_resolver::NodeResolutionMode;
+use node_resolver::NodeResolutionKind;
+use node_resolver::ResolutionMode;
 use tokio::select;
 
 use crate::args::CliLockfile;
 use crate::args::DenoSubcommand;
+use crate::args::NpmCachingStrategy;
 use crate::args::StorageKeyResolver;
 use crate::errors;
+use crate::node::CliNodeResolver;
+use crate::node::CliPackageJsonResolver;
 use crate::npm::CliNpmResolver;
+use crate::sys::CliSys;
 use crate::util::checksum;
 use crate::util::file_watcher::WatcherCommunicator;
 use crate::util::file_watcher::WatcherRestartMode;
@@ -81,6 +83,15 @@ pub trait HmrRunner: Send + Sync {
   async fn start(&mut self) -> Result<(), AnyError>;
   async fn stop(&mut self) -> Result<(), AnyError>;
   async fn run(&mut self) -> Result<(), AnyError>;
+}
+
+pub trait CliCodeCache: code_cache::CodeCache {
+  /// Gets if the code cache is still enabled.
+  fn enabled(&self) -> bool {
+    true
+  }
+
+  fn as_code_cache(self: Arc<Self>) -> Arc<dyn code_cache::CodeCache>;
 }
 
 #[async_trait::async_trait(?Send)]
@@ -127,7 +138,7 @@ pub struct CliMainWorkerOptions {
 struct SharedWorkerState {
   blob_store: Arc<BlobStore>,
   broadcast_channel: InMemoryBroadcastChannel,
-  code_cache: Option<Arc<dyn code_cache::CodeCache>>,
+  code_cache: Option<Arc<dyn CliCodeCache>>,
   compiled_wasm_module_store: CompiledWasmModuleStore,
   feature_checker: Arc<FeatureChecker>,
   fs: Arc<dyn deno_fs::FileSystem>,
@@ -135,28 +146,31 @@ struct SharedWorkerState {
   maybe_inspector_server: Option<Arc<InspectorServer>>,
   maybe_lockfile: Option<Arc<CliLockfile>>,
   module_loader_factory: Box<dyn ModuleLoaderFactory>,
-  node_resolver: Arc<NodeResolver>,
+  node_resolver: Arc<CliNodeResolver>,
   npm_resolver: Arc<dyn CliNpmResolver>,
-  pkg_json_resolver: Arc<PackageJsonResolver>,
+  pkg_json_resolver: Arc<CliPackageJsonResolver>,
   root_cert_store_provider: Arc<dyn RootCertStoreProvider>,
   root_permissions: PermissionsContainer,
   shared_array_buffer_store: SharedArrayBufferStore,
   storage_key_resolver: StorageKeyResolver,
+  sys: CliSys,
   options: CliMainWorkerOptions,
   subcommand: DenoSubcommand,
-  otel_config: Option<OtelConfig>, // `None` means OpenTelemetry is disabled.
+  otel_config: OtelConfig,
+  default_npm_caching_strategy: NpmCachingStrategy,
 }
 
 impl SharedWorkerState {
   pub fn create_node_init_services(
     &self,
     node_require_loader: NodeRequireLoaderRc,
-  ) -> NodeExtInitServices {
+  ) -> NodeExtInitServices<CliSys> {
     NodeExtInitServices {
       node_require_loader,
       node_resolver: self.node_resolver.clone(),
       npm_resolver: self.npm_resolver.clone().into_npm_pkg_folder_resolver(),
       pkg_json_resolver: self.pkg_json_resolver.clone(),
+      sys: self.sys.clone(),
     }
   }
 
@@ -384,6 +398,13 @@ impl CliMainWorker {
   }
 }
 
+// TODO(bartlomieju): this should be moved to some other place, added to avoid string
+// duplication between worker setups and `deno info` output.
+pub fn get_cache_storage_dir() -> PathBuf {
+  // Note: we currently use temp_dir() to avoid managing storage size.
+  std::env::temp_dir().join("deno_cache")
+}
+
 #[derive(Clone)]
 pub struct CliMainWorkerFactory {
   shared: Arc<SharedWorkerState>,
@@ -393,22 +414,24 @@ impl CliMainWorkerFactory {
   #[allow(clippy::too_many_arguments)]
   pub fn new(
     blob_store: Arc<BlobStore>,
-    code_cache: Option<Arc<dyn code_cache::CodeCache>>,
+    code_cache: Option<Arc<dyn CliCodeCache>>,
     feature_checker: Arc<FeatureChecker>,
     fs: Arc<dyn deno_fs::FileSystem>,
     maybe_file_watcher_communicator: Option<Arc<WatcherCommunicator>>,
     maybe_inspector_server: Option<Arc<InspectorServer>>,
     maybe_lockfile: Option<Arc<CliLockfile>>,
     module_loader_factory: Box<dyn ModuleLoaderFactory>,
-    node_resolver: Arc<NodeResolver>,
+    node_resolver: Arc<CliNodeResolver>,
     npm_resolver: Arc<dyn CliNpmResolver>,
-    pkg_json_resolver: Arc<PackageJsonResolver>,
+    pkg_json_resolver: Arc<CliPackageJsonResolver>,
     root_cert_store_provider: Arc<dyn RootCertStoreProvider>,
     root_permissions: PermissionsContainer,
     storage_key_resolver: StorageKeyResolver,
+    sys: CliSys,
     subcommand: DenoSubcommand,
     options: CliMainWorkerOptions,
-    otel_config: Option<OtelConfig>,
+    otel_config: OtelConfig,
+    default_npm_caching_strategy: NpmCachingStrategy,
   ) -> Self {
     Self {
       shared: Arc::new(SharedWorkerState {
@@ -429,9 +452,11 @@ impl CliMainWorkerFactory {
         root_permissions,
         shared_array_buffer_store: Default::default(),
         storage_key_resolver,
+        sys,
         options,
         subcommand,
         otel_config,
+        default_npm_caching_strategy,
       }),
     }
   }
@@ -471,8 +496,19 @@ impl CliMainWorkerFactory {
       NpmPackageReqReference::from_specifier(&main_module)
     {
       if let Some(npm_resolver) = shared.npm_resolver.as_managed() {
+        let reqs = &[package_ref.req().clone()];
         npm_resolver
-          .add_package_reqs(&[package_ref.req().clone()])
+          .add_package_reqs(
+            reqs,
+            if matches!(
+              shared.default_npm_caching_strategy,
+              NpmCachingStrategy::Lazy
+            ) {
+              crate::npm::PackageCaching::Only(reqs.into())
+            } else {
+              crate::npm::PackageCaching::All
+            },
+          )
           .await?;
       }
 
@@ -520,10 +556,7 @@ impl CliMainWorkerFactory {
     });
     let cache_storage_dir = maybe_storage_key.map(|key| {
       // TODO(@satyarohith): storage quota management
-      // Note: we currently use temp_dir() to avoid managing storage size.
-      std::env::temp_dir()
-        .join("deno_cache")
-        .join(checksum::gen(&[key.as_bytes()]))
+      get_cache_storage_dir().join(checksum::gen(&[key.as_bytes()]))
     });
 
     // TODO(bartlomieju): this is cruft, update FeatureChecker to spit out
@@ -554,7 +587,7 @@ impl CliMainWorkerFactory {
       ),
       feature_checker,
       permissions,
-      v8_code_cache: shared.code_cache.clone(),
+      v8_code_cache: shared.code_cache.clone().map(|c| c.as_code_cache()),
     };
 
     let options = WorkerOptions {
@@ -584,6 +617,7 @@ impl CliMainWorkerFactory {
         serve_port: shared.options.serve_port,
         serve_host: shared.options.serve_host.clone(),
         otel_config: shared.otel_config.clone(),
+        close_on_idle: true,
       },
       extensions: custom_extensions,
       startup_snapshot: crate::js::deno_isolate_init(),
@@ -604,6 +638,8 @@ impl CliMainWorkerFactory {
       origin_storage_dir,
       stdio,
       skip_op_registration: shared.options.skip_op_registration,
+      enable_stack_trace_arg_in_ops: crate::args::has_trace_permissions_enabled(
+      ),
     };
 
     let mut worker = MainWorker::bootstrap_from_options(
@@ -625,7 +661,10 @@ impl CliMainWorkerFactory {
         "40_test_common.js",
         "40_test.js",
         "40_bench.js",
-        "40_jupyter.js"
+        "40_jupyter.js",
+        // TODO(bartlomieju): probably shouldn't include these files here?
+        "40_lint_selector.js",
+        "40_lint.js"
       );
     }
 
@@ -683,8 +722,8 @@ impl CliMainWorkerFactory {
         package_folder,
         sub_path,
         /* referrer */ None,
-        NodeModuleKind::Esm,
-        NodeResolutionMode::Execution,
+        ResolutionMode::Import,
+        NodeResolutionKind::Execution,
       )?;
     if specifier
       .to_file_path()
@@ -720,10 +759,7 @@ fn create_web_worker_callback(
       .resolve_storage_key(&args.main_module);
     let cache_storage_dir = maybe_storage_key.map(|key| {
       // TODO(@satyarohith): storage quota management
-      // Note: we currently use temp_dir() to avoid managing storage size.
-      std::env::temp_dir()
-        .join("deno_cache")
-        .join(checksum::gen(&[key.as_bytes()]))
+      get_cache_storage_dir().join(checksum::gen(&[key.as_bytes()]))
     });
 
     // TODO(bartlomieju): this is cruft, update FeatureChecker to spit out
@@ -785,6 +821,7 @@ fn create_web_worker_callback(
         serve_port: shared.options.serve_port,
         serve_host: shared.options.serve_host.clone(),
         otel_config: shared.otel_config.clone(),
+        close_on_idle: args.close_on_idle,
       },
       extensions: vec![],
       startup_snapshot: crate::js::deno_isolate_init(),
@@ -803,6 +840,8 @@ fn create_web_worker_callback(
       strace_ops: shared.options.strace_ops.clone(),
       close_on_idle: args.close_on_idle,
       maybe_worker_metadata: args.maybe_worker_metadata,
+      enable_stack_trace_arg_in_ops: crate::args::has_trace_permissions_enabled(
+      ),
     };
 
     WebWorker::bootstrap_from_options(services, options)
@@ -824,25 +863,27 @@ pub fn create_isolate_create_params() -> Option<v8::CreateParams> {
 #[allow(clippy::print_stderr)]
 #[cfg(test)]
 mod tests {
-  use super::*;
   use deno_core::resolve_path;
   use deno_core::FsModuleLoader;
   use deno_fs::RealFs;
   use deno_runtime::deno_permissions::Permissions;
   use deno_runtime::permissions::RuntimePermissionDescriptorParser;
 
+  use super::*;
+
   fn create_test_worker() -> MainWorker {
     let main_module =
       resolve_path("./hello.js", &std::env::current_dir().unwrap()).unwrap();
     let fs = Arc::new(RealFs);
-    let permission_desc_parser =
-      Arc::new(RuntimePermissionDescriptorParser::new(fs.clone()));
+    let permission_desc_parser = Arc::new(
+      RuntimePermissionDescriptorParser::new(crate::sys::CliSys::default()),
+    );
     let options = WorkerOptions {
       startup_snapshot: crate::js::deno_isolate_init(),
       ..Default::default()
     };
 
-    MainWorker::bootstrap_from_options(
+    MainWorker::bootstrap_from_options::<CliSys>(
       main_module,
       WorkerServiceOptions {
         module_loader: Rc::new(FsModuleLoader),

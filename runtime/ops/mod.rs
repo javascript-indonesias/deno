@@ -1,10 +1,9 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 pub mod bootstrap;
 pub mod fs_events;
 pub mod http;
 pub mod os;
-pub mod otel;
 pub mod permissions;
 pub mod process;
 pub mod runtime;

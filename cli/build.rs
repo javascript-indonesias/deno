@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use std::env;
 use std::path::PathBuf;
@@ -8,16 +8,18 @@ use deno_runtime::*;
 mod shared;
 
 mod ts {
-  use super::*;
+  use std::collections::HashMap;
+  use std::io::Write;
+  use std::path::Path;
+  use std::path::PathBuf;
+
   use deno_core::error::custom_error;
   use deno_core::error::AnyError;
   use deno_core::op2;
   use deno_core::OpState;
   use serde::Serialize;
-  use std::collections::HashMap;
-  use std::io::Write;
-  use std::path::Path;
-  use std::path::PathBuf;
+
+  use super::*;
 
   #[derive(Debug, Serialize)]
   #[serde(rename_all = "camelCase")]
@@ -399,6 +401,24 @@ fn main() {
 
   println!("cargo:rustc-env=TARGET={}", env::var("TARGET").unwrap());
   println!("cargo:rustc-env=PROFILE={}", env::var("PROFILE").unwrap());
+
+  if cfg!(windows) {
+    // these dls load slowly, so delay loading them
+    let dlls = [
+      // webgpu
+      "d3dcompiler_47",
+      "OPENGL32",
+      // network related functions
+      "iphlpapi",
+    ];
+    for dll in dlls {
+      println!("cargo:rustc-link-arg-bin=deno=/delayload:{dll}.dll");
+      println!("cargo:rustc-link-arg-bin=denort=/delayload:{dll}.dll");
+    }
+    // enable delay loading
+    println!("cargo:rustc-link-arg-bin=deno=delayimp.lib");
+    println!("cargo:rustc-link-arg-bin=denort=delayimp.lib");
+  }
 
   let c = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
   let o = PathBuf::from(env::var_os("OUT_DIR").unwrap());

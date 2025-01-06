@@ -1,5 +1,7 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 // Utilities shared between `build.rs` and the rest of the crate.
+
+use std::path::Path;
 
 use deno_ast::MediaType;
 use deno_ast::ParseParams;
@@ -10,7 +12,6 @@ use deno_core::Extension;
 use deno_core::ModuleCodeString;
 use deno_core::ModuleName;
 use deno_core::SourceMapData;
-use std::path::Path;
 
 extension!(runtime,
   deps = [
@@ -47,7 +48,6 @@ extension!(runtime,
     "40_signals.js",
     "40_tty.js",
     "41_prompt.js",
-    "telemetry.js",
     "90_deno_ns.js",
     "98_global_scope_shared.js",
     "98_global_scope_window.js",

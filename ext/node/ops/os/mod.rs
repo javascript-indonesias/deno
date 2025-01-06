@@ -1,10 +1,12 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use std::mem::MaybeUninit;
 
-use crate::NodePermissions;
 use deno_core::op2;
 use deno_core::OpState;
+use sys_traits::EnvHomeDir;
+
+use crate::NodePermissions;
 
 mod cpus;
 pub mod priority;
@@ -21,7 +23,7 @@ pub enum OsError {
   FailedToGetUserInfo(#[source] std::io::Error),
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_node_os_get_priority<P>(
   state: &mut OpState,
   pid: u32,
@@ -37,7 +39,7 @@ where
   priority::get_priority(pid).map_err(OsError::Priority)
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_node_os_set_priority<P>(
   state: &mut OpState,
   pid: u32,
@@ -193,7 +195,7 @@ fn get_user_info(_uid: u32) -> Result<UserInfo, OsError> {
   })
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 pub fn op_node_os_user_info<P>(
   state: &mut OpState,
@@ -212,7 +214,7 @@ where
   get_user_info(uid)
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_geteuid<P>(
   state: &mut OpState,
 ) -> Result<u32, deno_core::error::AnyError>
@@ -233,7 +235,7 @@ where
   Ok(euid)
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_getegid<P>(
   state: &mut OpState,
 ) -> Result<u32, deno_core::error::AnyError>
@@ -254,7 +256,7 @@ where
   Ok(egid)
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 pub fn op_cpus<P>(state: &mut OpState) -> Result<Vec<cpus::CpuInfo>, OsError>
 where
@@ -268,7 +270,7 @@ where
   cpus::cpu_info().ok_or(OsError::FailedToGetCpuInfo)
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[string]
 pub fn op_homedir<P>(
   state: &mut OpState,
@@ -281,5 +283,9 @@ where
     permissions.check_sys("homedir", "node:os.homedir()")?;
   }
 
-  Ok(home::home_dir().map(|path| path.to_string_lossy().to_string()))
+  Ok(
+    sys_traits::impls::RealSys
+      .env_home_dir()
+      .map(|path| path.to_string_lossy().to_string()),
+  )
 }

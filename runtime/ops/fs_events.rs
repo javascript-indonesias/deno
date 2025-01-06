@@ -1,5 +1,14 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::convert::From;
+use std::path::Path;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use deno_core::op2;
 use deno_core::parking_lot::Mutex;
 use deno_core::AsyncRefCell;
 use deno_core::CancelFuture;
@@ -8,9 +17,6 @@ use deno_core::OpState;
 use deno_core::RcRef;
 use deno_core::Resource;
 use deno_core::ResourceId;
-
-use deno_core::op2;
-
 use deno_permissions::PermissionsContainer;
 use notify::event::Event as NotifyEvent;
 use notify::event::ModifyKind;
@@ -20,13 +26,6 @@ use notify::RecommendedWatcher;
 use notify::RecursiveMode;
 use notify::Watcher;
 use serde::Serialize;
-use std::borrow::Cow;
-use std::cell::RefCell;
-use std::convert::From;
-use std::path::Path;
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
 use tokio::sync::mpsc;
 
 deno_core::extension!(
@@ -109,6 +108,14 @@ fn starts_with_canonicalized(path: &Path, prefix: &str) -> bool {
   }
 }
 
+fn is_file_removed(event_path: &PathBuf) -> bool {
+  let exists_path = std::fs::exists(event_path);
+  match exists_path {
+    Ok(res) => !res,
+    Err(_) => false,
+  }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum FsEventsError {
   #[error(transparent)]
@@ -150,6 +157,13 @@ fn start_watcher(
             })
           }) {
             let _ = sender.try_send(Ok(event.clone()));
+          } else if event.paths.iter().any(is_file_removed) {
+            let remove_event = FsEvent {
+              kind: "remove",
+              paths: event.paths.clone(),
+              flag: None,
+            };
+            let _ = sender.try_send(Ok(remove_event));
           }
         }
       }
@@ -162,7 +176,7 @@ fn start_watcher(
   Ok(())
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[smi]
 fn op_fs_events_open(
   state: &mut OpState,

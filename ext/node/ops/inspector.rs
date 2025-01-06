@@ -1,6 +1,8 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use crate::NodePermissions;
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use deno_core::anyhow::Error;
 use deno_core::error::generic_error;
 use deno_core::futures::channel::mpsc;
@@ -11,8 +13,8 @@ use deno_core::InspectorSessionKind;
 use deno_core::InspectorSessionOptions;
 use deno_core::JsRuntimeInspector;
 use deno_core::OpState;
-use std::cell::RefCell;
-use std::rc::Rc;
+
+use crate::NodePermissions;
 
 #[op2(fast)]
 pub fn op_inspector_enabled() -> bool {
@@ -20,7 +22,7 @@ pub fn op_inspector_enabled() -> bool {
   false
 }
 
-#[op2]
+#[op2(stack_trace)]
 pub fn op_inspector_open<P>(
   _state: &mut OpState,
   _port: Option<u16>,
@@ -85,7 +87,7 @@ struct JSInspectorSession {
 
 impl GarbageCollected for JSInspectorSession {}
 
-#[op2]
+#[op2(stack_trace)]
 #[cppgc]
 pub fn op_inspector_connect<'s, P>(
   isolate: *mut v8::Isolate,

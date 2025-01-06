@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 pub use deno_broadcast_channel;
 pub use deno_cache;
@@ -34,6 +34,7 @@ pub mod inspector_server;
 pub mod js;
 pub mod ops;
 pub mod permissions;
+pub mod signal;
 pub mod snapshot;
 pub mod sys_info;
 pub mod tokio_util;
@@ -45,7 +46,7 @@ pub use worker_bootstrap::BootstrapOptions;
 pub use worker_bootstrap::WorkerExecutionMode;
 pub use worker_bootstrap::WorkerLogLevel;
 
-mod shared;
+pub mod shared;
 pub use shared::runtime;
 
 pub struct UnstableGranularFlag {
@@ -148,7 +149,7 @@ pub static UNSTABLE_GRANULAR_FLAGS: &[UnstableGranularFlag] = &[
 ];
 
 pub fn exit(code: i32) -> ! {
-  crate::ops::otel::flush();
+  deno_telemetry::flush();
   #[allow(clippy::disallowed_methods)]
   std::process::exit(code);
 }

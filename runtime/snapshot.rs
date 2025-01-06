@@ -1,9 +1,12 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use crate::ops;
-use crate::ops::bootstrap::SnapshotOptions;
-use crate::shared::maybe_transpile_source;
-use crate::shared::runtime;
+use std::borrow::Cow;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+use std::rc::Rc;
+use std::sync::Arc;
+
 use deno_cache::SqliteBackedCache;
 use deno_core::snapshot::*;
 use deno_core::v8;
@@ -11,12 +14,11 @@ use deno_core::Extension;
 use deno_http::DefaultHttpPropertyExtractor;
 use deno_io::fs::FsError;
 use deno_permissions::PermissionCheckError;
-use std::borrow::Cow;
-use std::io::Write;
-use std::path::Path;
-use std::path::PathBuf;
-use std::rc::Rc;
-use std::sync::Arc;
+
+use crate::ops;
+use crate::ops::bootstrap::SnapshotOptions;
+use crate::shared::maybe_transpile_source;
+use crate::shared::runtime;
 
 #[derive(Clone)]
 struct Permissions;
@@ -268,6 +270,7 @@ pub fn create_runtime_snapshot(
   // `runtime/worker.rs`, `runtime/web_worker.rs` and `runtime/snapshot.rs`!
   let fs = std::sync::Arc::new(deno_fs::RealFs);
   let mut extensions: Vec<Extension> = vec![
+    deno_telemetry::deno_telemetry::init_ops_and_esm(),
     deno_webidl::deno_webidl::init_ops_and_esm(),
     deno_console::deno_console::init_ops_and_esm(),
     deno_url::deno_url::init_ops_and_esm(),
@@ -300,10 +303,15 @@ pub fn create_runtime_snapshot(
       deno_cron::local::LocalCronHandler::new(),
     ),
     deno_napi::deno_napi::init_ops_and_esm::<Permissions>(),
-    deno_http::deno_http::init_ops_and_esm::<DefaultHttpPropertyExtractor>(),
+    deno_http::deno_http::init_ops_and_esm::<DefaultHttpPropertyExtractor>(
+      deno_http::Options::default(),
+    ),
     deno_io::deno_io::init_ops_and_esm(Default::default()),
     deno_fs::deno_fs::init_ops_and_esm::<Permissions>(fs.clone()),
-    deno_node::deno_node::init_ops_and_esm::<Permissions>(None, fs.clone()),
+    deno_node::deno_node::init_ops_and_esm::<
+      Permissions,
+      sys_traits::impls::RealSys,
+    >(None, fs.clone()),
     runtime::init_ops_and_esm(),
     ops::runtime::deno_runtime::init_ops("deno:runtime".parse().unwrap()),
     ops::worker_host::deno_worker_host::init_ops(
@@ -312,7 +320,6 @@ pub fn create_runtime_snapshot(
     ),
     ops::fs_events::deno_fs_events::init_ops(),
     ops::os::deno_os::init_ops(Default::default()),
-    ops::otel::deno_otel::init_ops(),
     ops::permissions::deno_permissions::init_ops(),
     ops::process::deno_process::init_ops(None),
     ops::signal::deno_signal::init_ops(),

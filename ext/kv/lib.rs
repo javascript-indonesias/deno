@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 pub mod config;
 pub mod dynamic;
@@ -178,7 +178,7 @@ pub enum KvErrorKind {
   InvalidRange,
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[smi]
 async fn op_kv_database_open<DBH>(
   state: Rc<RefCell<OpState>>,

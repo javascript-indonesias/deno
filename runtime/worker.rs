@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
@@ -39,6 +39,7 @@ use deno_fs::FileSystem;
 use deno_http::DefaultHttpPropertyExtractor;
 use deno_io::Stdio;
 use deno_kv::dynamic::MultiBackendDbHandler;
+use deno_node::ExtNodeSys;
 use deno_node::NodeExtInitServices;
 use deno_permissions::PermissionsContainer;
 use deno_tls::RootCertStoreProvider;
@@ -78,7 +79,7 @@ pub fn validate_import_attributes_callback(
   for (key, value) in attributes {
     let msg = if key != "type" {
       Some(format!("\"{key}\" attribute is not supported."))
-    } else if value != "json" {
+    } else if value != "json" && value != "$$deno-core-internal-wasm-module" {
       Some(format!("\"{value}\" is not a valid module type."))
     } else {
       None
@@ -128,7 +129,7 @@ pub struct MainWorker {
   dispatch_process_exit_event_fn_global: v8::Global<v8::Function>,
 }
 
-pub struct WorkerServiceOptions {
+pub struct WorkerServiceOptions<TExtNodeSys: ExtNodeSys> {
   pub blob_store: Arc<BlobStore>,
   pub broadcast_channel: InMemoryBroadcastChannel,
   pub feature_checker: Arc<FeatureChecker>,
@@ -139,7 +140,7 @@ pub struct WorkerServiceOptions {
   /// If not provided runtime will error if code being
   /// executed tries to load modules.
   pub module_loader: Rc<dyn ModuleLoader>,
-  pub node_services: Option<NodeExtInitServices>,
+  pub node_services: Option<NodeExtInitServices<TExtNodeSys>>,
   pub npm_process_state_provider: Option<NpmProcessStateProviderRc>,
   pub permissions: PermissionsContainer,
   pub root_cert_store_provider: Option<Arc<dyn RootCertStoreProvider>>,
@@ -207,6 +208,7 @@ pub struct WorkerOptions {
   pub cache_storage_dir: Option<std::path::PathBuf>,
   pub origin_storage_dir: Option<std::path::PathBuf>,
   pub stdio: Stdio,
+  pub enable_stack_trace_arg_in_ops: bool,
 }
 
 impl Default for WorkerOptions {
@@ -231,6 +233,7 @@ impl Default for WorkerOptions {
       create_params: Default::default(),
       bootstrap: Default::default(),
       stdio: Default::default(),
+      enable_stack_trace_arg_in_ops: false,
     }
   }
 }
@@ -302,9 +305,9 @@ pub fn create_op_metrics(
 }
 
 impl MainWorker {
-  pub fn bootstrap_from_options(
+  pub fn bootstrap_from_options<TExtNodeSys: ExtNodeSys + 'static>(
     main_module: ModuleSpecifier,
-    services: WorkerServiceOptions,
+    services: WorkerServiceOptions<TExtNodeSys>,
     options: WorkerOptions,
   ) -> Self {
     let (mut worker, bootstrap_options) =
@@ -313,9 +316,9 @@ impl MainWorker {
     worker
   }
 
-  fn from_options(
+  fn from_options<TExtNodeSys: ExtNodeSys + 'static>(
     main_module: ModuleSpecifier,
-    services: WorkerServiceOptions,
+    services: WorkerServiceOptions<TExtNodeSys>,
     mut options: WorkerOptions,
   ) -> (Self, BootstrapOptions) {
     deno_core::extension!(deno_permissions_worker,
@@ -346,6 +349,7 @@ impl MainWorker {
     // NOTE(bartlomieju): ordering is important here, keep it in sync with
     // `runtime/web_worker.rs` and `runtime/snapshot.rs`!
     let mut extensions = vec![
+      deno_telemetry::deno_telemetry::init_ops_and_esm(),
       // Web APIs
       deno_webidl::deno_webidl::init_ops_and_esm(),
       deno_console::deno_console::init_ops_and_esm(),
@@ -407,12 +411,14 @@ impl MainWorker {
       ),
       deno_cron::deno_cron::init_ops_and_esm(LocalCronHandler::new()),
       deno_napi::deno_napi::init_ops_and_esm::<PermissionsContainer>(),
-      deno_http::deno_http::init_ops_and_esm::<DefaultHttpPropertyExtractor>(),
+      deno_http::deno_http::init_ops_and_esm::<DefaultHttpPropertyExtractor>(
+        deno_http::Options::default(),
+      ),
       deno_io::deno_io::init_ops_and_esm(Some(options.stdio)),
       deno_fs::deno_fs::init_ops_and_esm::<PermissionsContainer>(
         services.fs.clone(),
       ),
-      deno_node::deno_node::init_ops_and_esm::<PermissionsContainer>(
+      deno_node::deno_node::init_ops_and_esm::<PermissionsContainer, TExtNodeSys>(
         services.node_services,
         services.fs,
       ),
@@ -424,7 +430,6 @@ impl MainWorker {
       ),
       ops::fs_events::deno_fs_events::init_ops_and_esm(),
       ops::os::deno_os::init_ops_and_esm(exit_code.clone()),
-      ops::otel::deno_otel::init_ops_and_esm(),
       ops::permissions::deno_permissions::init_ops_and_esm(),
       ops::process::deno_process::init_ops_and_esm(
         services.npm_process_state_provider,
@@ -542,6 +547,11 @@ impl MainWorker {
           ) as Box<dyn Fn(_, _, &_)>,
         )
       }),
+      maybe_op_stack_trace_callback: if options.enable_stack_trace_arg_in_ops {
+        Some(Box::new(|stack| {
+          deno_permissions::prompter::set_current_stacktrace(stack)
+        }))
+      } else { None },
       ..Default::default()
     });
 

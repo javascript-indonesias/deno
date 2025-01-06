@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use ::deno_permissions::PermissionState;
 use ::deno_permissions::PermissionsContainer;
@@ -99,7 +99,7 @@ pub fn op_revoke_permission(
   Ok(PermissionStatus::from(perm))
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 pub fn op_request_permission(
   state: &mut OpState,

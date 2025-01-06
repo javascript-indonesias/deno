@@ -1,33 +1,30 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 mod byonm;
-mod common;
 mod managed;
+mod permission_checker;
 
-use std::borrow::Cow;
 use std::path::Path;
 use std::sync::Arc;
 
-use common::maybe_auth_header_for_npm_registry;
 use dashmap::DashMap;
 use deno_core::error::AnyError;
 use deno_core::serde_json;
+use deno_core::url::Url;
 use deno_npm::npm_rc::ResolvedNpmRc;
 use deno_npm::registry::NpmPackageInfo;
 use deno_resolver::npm::ByonmInNpmPackageChecker;
 use deno_resolver::npm::ByonmNpmResolver;
 use deno_resolver::npm::CliNpmReqResolver;
 use deno_resolver::npm::ResolvePkgFolderFromDenoReqError;
-use deno_runtime::deno_node::NodePermissions;
 use deno_runtime::ops::process::NpmProcessStateProvider;
 use deno_semver::package::PackageNv;
 use deno_semver::package::PackageReq;
-use managed::cache::registry_info::get_package_url;
+use http::HeaderName;
+use http::HeaderValue;
 use managed::create_managed_in_npm_pkg_checker;
 use node_resolver::InNpmPackageChecker;
 use node_resolver::NpmPackageFolderResolver;
-
-use crate::file_fetcher::FileFetcher;
 
 pub use self::byonm::CliByonmNpmResolver;
 pub use self::byonm::CliByonmNpmResolverCreateOptions;
@@ -35,6 +32,76 @@ pub use self::managed::CliManagedInNpmPkgCheckerCreateOptions;
 pub use self::managed::CliManagedNpmResolverCreateOptions;
 pub use self::managed::CliNpmResolverManagedSnapshotOption;
 pub use self::managed::ManagedCliNpmResolver;
+pub use self::managed::PackageCaching;
+pub use self::permission_checker::NpmRegistryReadPermissionChecker;
+pub use self::permission_checker::NpmRegistryReadPermissionCheckerMode;
+use crate::file_fetcher::CliFileFetcher;
+use crate::http_util::HttpClientProvider;
+use crate::sys::CliSys;
+use crate::util::progress_bar::ProgressBar;
+
+pub type CliNpmTarballCache =
+  deno_npm_cache::TarballCache<CliNpmCacheHttpClient, CliSys>;
+pub type CliNpmCache = deno_npm_cache::NpmCache<CliSys>;
+pub type CliNpmRegistryInfoProvider =
+  deno_npm_cache::RegistryInfoProvider<CliNpmCacheHttpClient, CliSys>;
+
+#[derive(Debug)]
+pub struct CliNpmCacheHttpClient {
+  http_client_provider: Arc<HttpClientProvider>,
+  progress_bar: ProgressBar,
+}
+
+impl CliNpmCacheHttpClient {
+  pub fn new(
+    http_client_provider: Arc<HttpClientProvider>,
+    progress_bar: ProgressBar,
+  ) -> Self {
+    Self {
+      http_client_provider,
+      progress_bar,
+    }
+  }
+}
+
+#[async_trait::async_trait(?Send)]
+impl deno_npm_cache::NpmCacheHttpClient for CliNpmCacheHttpClient {
+  async fn download_with_retries_on_any_tokio_runtime(
+    &self,
+    url: Url,
+    maybe_auth_header: Option<(HeaderName, HeaderValue)>,
+  ) -> Result<Option<Vec<u8>>, deno_npm_cache::DownloadError> {
+    let guard = self.progress_bar.update(url.as_str());
+    let client = self.http_client_provider.get_or_create().map_err(|err| {
+      deno_npm_cache::DownloadError {
+        status_code: None,
+        error: err,
+      }
+    })?;
+    client
+      .download_with_progress_and_retries(url, maybe_auth_header, &guard)
+      .await
+      .map_err(|err| {
+        use crate::http_util::DownloadErrorKind::*;
+        let status_code = match err.as_kind() {
+          Fetch { .. }
+          | UrlParse { .. }
+          | HttpParse { .. }
+          | Json { .. }
+          | ToStr { .. }
+          | RedirectHeaderParse { .. }
+          | TooManyRedirects => None,
+          BadResponse(bad_response_error) => {
+            Some(bad_response_error.status_code)
+          }
+        };
+        deno_npm_cache::DownloadError {
+          status_code,
+          error: err.into(),
+        }
+      })
+  }
+}
 
 pub enum CliNpmResolverCreateOptions {
   Managed(CliManagedNpmResolverCreateOptions),
@@ -117,12 +184,6 @@ pub trait CliNpmResolver: NpmPackageFolderResolver + CliNpmReqResolver {
 
   fn root_node_modules_path(&self) -> Option<&Path>;
 
-  fn ensure_read_permission<'a>(
-    &self,
-    permissions: &mut dyn NodePermissions,
-    path: &'a Path,
-  ) -> Result<Cow<'a, Path>, AnyError>;
-
   /// Returns a hash returning the state of the npm resolver
   /// or `None` if the state currently can't be determined.
   fn check_state_hash(&self) -> Option<u64>;
@@ -132,13 +193,13 @@ pub trait CliNpmResolver: NpmPackageFolderResolver + CliNpmReqResolver {
 pub struct NpmFetchResolver {
   nv_by_req: DashMap<PackageReq, Option<PackageNv>>,
   info_by_name: DashMap<String, Option<Arc<NpmPackageInfo>>>,
-  file_fetcher: Arc<FileFetcher>,
+  file_fetcher: Arc<CliFileFetcher>,
   npmrc: Arc<ResolvedNpmRc>,
 }
 
 impl NpmFetchResolver {
   pub fn new(
-    file_fetcher: Arc<FileFetcher>,
+    file_fetcher: Arc<CliFileFetcher>,
     npmrc: Arc<ResolvedNpmRc>,
   ) -> Self {
     Self {
@@ -179,13 +240,15 @@ impl NpmFetchResolver {
     if let Some(info) = self.info_by_name.get(name) {
       return info.value().clone();
     }
+    // todo(#27198): use RegistryInfoProvider instead
     let fetch_package_info = || async {
-      let info_url = get_package_url(&self.npmrc, name);
+      let info_url = deno_npm_cache::get_package_url(&self.npmrc, name);
       let file_fetcher = self.file_fetcher.clone();
       let registry_config = self.npmrc.get_registry_config(name);
       // TODO(bartlomieju): this should error out, not use `.ok()`.
       let maybe_auth_header =
-        maybe_auth_header_for_npm_registry(registry_config).ok()?;
+        deno_npm_cache::maybe_auth_header_for_npm_registry(registry_config)
+          .ok()?;
       // spawn due to the lsp's `Send` requirement
       let file = deno_core::unsync::spawn(async move {
         file_fetcher

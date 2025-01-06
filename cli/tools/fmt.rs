@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 //! This module provides file formatting utilities using
 //! [`dprint-plugin-typescript`](https://github.com/dprint/dprint-plugin-typescript).
@@ -7,20 +7,18 @@
 //! the future it can be easily extended to provide
 //! the same functions as ops available in JS runtime.
 
-use crate::args::CliOptions;
-use crate::args::Flags;
-use crate::args::FmtFlags;
-use crate::args::FmtOptions;
-use crate::args::FmtOptionsConfig;
-use crate::args::ProseWrap;
-use crate::args::UnstableFmtOptions;
-use crate::cache::Caches;
-use crate::colors;
-use crate::factory::CliFactory;
-use crate::util::diff::diff;
-use crate::util::file_watcher;
-use crate::util::fs::canonicalize_path;
-use crate::util::path::get_extension;
+use std::borrow::Cow;
+use std::fs;
+use std::io::stdin;
+use std::io::stdout;
+use std::io::Read;
+use std::io::Write;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::AtomicUsize;
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use deno_ast::ParsedSource;
 use deno_config::glob::FileCollector;
@@ -37,19 +35,23 @@ use deno_core::url::Url;
 use log::debug;
 use log::info;
 use log::warn;
-use std::borrow::Cow;
-use std::fs;
-use std::io::stdin;
-use std::io::stdout;
-use std::io::Read;
-use std::io::Write;
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::atomic::AtomicUsize;
-use std::sync::atomic::Ordering;
-use std::sync::Arc;
 
+use crate::args::CliOptions;
+use crate::args::Flags;
+use crate::args::FmtFlags;
+use crate::args::FmtOptions;
+use crate::args::FmtOptionsConfig;
+use crate::args::ProseWrap;
+use crate::args::UnstableFmtOptions;
+use crate::cache::Caches;
 use crate::cache::IncrementalCache;
+use crate::colors;
+use crate::factory::CliFactory;
+use crate::sys::CliSys;
+use crate::util::diff::diff;
+use crate::util::file_watcher;
+use crate::util::fs::canonicalize_path;
+use crate::util::path::get_extension;
 
 /// Format JavaScript/TypeScript files.
 pub async fn format(
@@ -57,7 +59,7 @@ pub async fn format(
   fmt_flags: FmtFlags,
 ) -> Result<(), AnyError> {
   if fmt_flags.is_stdin() {
-    let cli_options = CliOptions::from_flags(flags)?;
+    let cli_options = CliOptions::from_flags(&CliSys::default(), flags)?;
     let start_dir = &cli_options.start_dir;
     let fmt_config = start_dir
       .to_fmt_config(FilePatterns::new_with_base(start_dir.dir_path()))?;
@@ -228,8 +230,9 @@ fn collect_fmt_files(
   })
   .ignore_git_folder()
   .ignore_node_modules()
+  .use_gitignore()
   .set_vendor_folder(cli_options.vendor_dir_path().map(ToOwned::to_owned))
-  .collect_file_patterns(&deno_config::fs::RealDenoConfigFs, files)
+  .collect_file_patterns(&CliSys::default(), files)
 }
 
 /// Formats markdown (using <https://github.com/dprint/dprint-plugin-markdown>) and its code blocks
@@ -271,6 +274,7 @@ fn format_markdown(
           | "njk"
           | "yml"
           | "yaml"
+          | "sql"
       ) {
         // It's important to tell dprint proper file extension, otherwise
         // it might parse the file twice.
@@ -300,6 +304,13 @@ fn format_markdown(
             }
           }
           "yml" | "yaml" => format_yaml(text, fmt_options),
+          "sql" => {
+            if unstable_options.sql {
+              format_sql(text, fmt_options)
+            } else {
+              Ok(None)
+            }
+          }
           _ => {
             let mut codeblock_config =
               get_resolved_typescript_config(fmt_options);
@@ -431,8 +442,10 @@ pub fn format_html(
           )
         }
         _ => {
-          let mut typescript_config =
-            get_resolved_typescript_config(fmt_options);
+          let mut typescript_config_builder =
+            get_typescript_config_builder(fmt_options);
+          typescript_config_builder.file_indent_level(hints.indent_level);
+          let mut typescript_config = typescript_config_builder.build();
           typescript_config.line_width = hints.print_width as u32;
           dprint_plugin_typescript::format_text(
             &path,
@@ -502,7 +515,52 @@ pub fn format_html(
   })
 }
 
-/// Formats a single TS, TSX, JS, JSX, JSONC, JSON, MD, or IPYNB file.
+pub fn format_sql(
+  file_text: &str,
+  fmt_options: &FmtOptionsConfig,
+) -> Result<Option<String>, AnyError> {
+  let ignore_file = file_text
+    .lines()
+    .take_while(|line| line.starts_with("--"))
+    .any(|line| {
+      line
+        .strip_prefix("--")
+        .unwrap()
+        .trim()
+        .starts_with("deno-fmt-ignore-file")
+    });
+
+  if ignore_file {
+    return Ok(None);
+  }
+
+  let mut formatted_str = sqlformat::format(
+    file_text,
+    &sqlformat::QueryParams::None,
+    &sqlformat::FormatOptions {
+      ignore_case_convert: None,
+      indent: if fmt_options.use_tabs.unwrap_or_default() {
+        sqlformat::Indent::Tabs
+      } else {
+        sqlformat::Indent::Spaces(fmt_options.indent_width.unwrap_or(2))
+      },
+      // leave one blank line between queries.
+      lines_between_queries: 2,
+      uppercase: Some(true),
+    },
+  );
+
+  // Add single new line to the end of file.
+  formatted_str.push('\n');
+
+  Ok(if formatted_str == file_text {
+    None
+  } else {
+    Some(formatted_str)
+  })
+}
+
+/// Formats a single TS, TSX, JS, JSX, JSONC, JSON, MD, IPYNB or SQL file.
 pub fn format_file(
   file_path: &Path,
   file_text: &str,
@@ -537,6 +595,13 @@ pub fn format_file(
         format_file(file_path, &file_text, fmt_options, unstable_options, None)
       },
     ),
+    "sql" => {
+      if unstable_options.sql {
+        format_sql(file_text, fmt_options)
+      } else {
+        Ok(None)
+      }
+    }
     _ => {
       let config = get_resolved_typescript_config(fmt_options);
       dprint_plugin_typescript::format_text(
@@ -858,9 +923,9 @@ fn files_str(len: usize) -> &'static str {
   }
 }
 
-fn get_resolved_typescript_config(
+fn get_typescript_config_builder(
   options: &FmtOptionsConfig,
-) -> dprint_plugin_typescript::configuration::Configuration {
+) -> dprint_plugin_typescript::configuration::ConfigurationBuilder {
   let mut builder =
     dprint_plugin_typescript::configuration::ConfigurationBuilder::new();
   builder.deno();
@@ -892,7 +957,13 @@ fn get_resolved_typescript_config(
     });
   }
 
-  builder.build()
+  builder
+}
+
+fn get_resolved_typescript_config(
+  options: &FmtOptionsConfig,
+) -> dprint_plugin_typescript::configuration::Configuration {
+  get_typescript_config_builder(options).build()
 }
 
 fn get_resolved_markdown_config(
@@ -1014,6 +1085,7 @@ fn get_resolved_markup_fmt_config(
   };
 
   let language_options = LanguageOptions {
+    script_formatter: Some(markup_fmt::config::ScriptFormatter::Dprint),
     quotes: Quotes::Double,
     format_comments: false,
     script_indent: true,
@@ -1208,6 +1280,7 @@ fn is_supported_ext_fmt(path: &Path) -> bool {
         | "yml"
         | "yaml"
         | "ipynb"
+        | "sql"
     )
   })
 }
@@ -1268,6 +1341,11 @@ mod test {
     assert!(is_supported_ext_fmt(Path::new("foo.yaml")));
     assert!(is_supported_ext_fmt(Path::new("foo.YaML")));
     assert!(is_supported_ext_fmt(Path::new("foo.ipynb")));
+    assert!(is_supported_ext_fmt(Path::new("foo.sql")));
+    assert!(is_supported_ext_fmt(Path::new("foo.Sql")));
+    assert!(is_supported_ext_fmt(Path::new("foo.sQl")));
+    assert!(is_supported_ext_fmt(Path::new("foo.sqL")));
+    assert!(is_supported_ext_fmt(Path::new("foo.SQL")));
   }
 
   #[test]

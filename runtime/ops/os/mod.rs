@@ -1,7 +1,8 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use crate::sys_info;
-use crate::worker::ExitCode;
+use std::collections::HashMap;
+use std::env;
+
 use deno_core::op2;
 use deno_core::v8;
 use deno_core::OpState;
@@ -9,8 +10,9 @@ use deno_node::NODE_ENV_VAR_ALLOWLIST;
 use deno_path_util::normalize_path;
 use deno_permissions::PermissionsContainer;
 use serde::Serialize;
-use std::collections::HashMap;
-use std::env;
+
+use crate::sys_info;
+use crate::worker::ExitCode;
 
 deno_core::extension!(
   deno_os,
@@ -87,7 +89,7 @@ pub enum OsError {
   Io(#[from] std::io::Error),
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[string]
 fn op_exec_path(state: &mut OpState) -> Result<String, OsError> {
   let current_exe = env::current_exe().unwrap();
@@ -103,7 +105,7 @@ fn op_exec_path(state: &mut OpState) -> Result<String, OsError> {
     .map_err(OsError::InvalidUtf8)
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 fn op_set_env(
   state: &mut OpState,
   #[string] key: &str,
@@ -123,7 +125,7 @@ fn op_set_env(
   Ok(())
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 fn op_env(
   state: &mut OpState,
@@ -132,7 +134,7 @@ fn op_env(
   Ok(env::vars().collect())
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[string]
 fn op_get_env(
   state: &mut OpState,
@@ -159,7 +161,7 @@ fn op_get_env(
   Ok(r)
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 fn op_delete_env(
   state: &mut OpState,
   #[string] key: String,
@@ -189,7 +191,7 @@ fn op_exit(state: &mut OpState) {
   crate::exit(code)
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 fn op_loadavg(
   state: &mut OpState,
@@ -200,7 +202,7 @@ fn op_loadavg(
   Ok(sys_info::loadavg())
 }
 
-#[op2]
+#[op2(stack_trace, stack_trace)]
 #[string]
 fn op_hostname(
   state: &mut OpState,
@@ -211,7 +213,7 @@ fn op_hostname(
   Ok(sys_info::hostname())
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[string]
 fn op_os_release(
   state: &mut OpState,
@@ -222,7 +224,7 @@ fn op_os_release(
   Ok(sys_info::os_release())
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 fn op_network_interfaces(
   state: &mut OpState,
@@ -274,7 +276,7 @@ impl From<netif::Interface> for NetworkInterface {
   }
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 fn op_system_memory_info(
   state: &mut OpState,
@@ -286,7 +288,7 @@ fn op_system_memory_info(
 }
 
 #[cfg(not(windows))]
-#[op2]
+#[op2(stack_trace)]
 #[smi]
 fn op_gid(
   state: &mut OpState,
@@ -302,7 +304,7 @@ fn op_gid(
 }
 
 #[cfg(windows)]
-#[op2]
+#[op2(stack_trace)]
 #[smi]
 fn op_gid(
   state: &mut OpState,
@@ -314,7 +316,7 @@ fn op_gid(
 }
 
 #[cfg(not(windows))]
-#[op2]
+#[op2(stack_trace)]
 #[smi]
 fn op_uid(
   state: &mut OpState,
@@ -330,7 +332,7 @@ fn op_uid(
 }
 
 #[cfg(windows)]
-#[op2]
+#[op2(stack_trace)]
 #[smi]
 fn op_uid(
   state: &mut OpState,
@@ -424,8 +426,11 @@ fn rss() -> usize {
   let mut count = libc::MACH_TASK_BASIC_INFO_COUNT;
   // SAFETY: libc calls
   let r = unsafe {
+    extern "C" {
+      static mut mach_task_self_: std::ffi::c_uint;
+    }
     libc::task_info(
-      libc::mach_task_self(),
+      mach_task_self_,
       libc::MACH_TASK_BASIC_INFO,
       task_info.as_mut_ptr() as libc::task_info_t,
       &mut count as *mut libc::mach_msg_type_number_t,
@@ -519,7 +524,7 @@ fn os_uptime(state: &mut OpState) -> Result<u64, deno_core::error::AnyError> {
   Ok(sys_info::os_uptime())
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 #[number]
 fn op_os_uptime(
   state: &mut OpState,

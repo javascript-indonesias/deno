@@ -1,4 +1,28 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+use std::collections::BTreeMap;
+use std::rc::Rc;
+use std::sync::Arc;
+
+use deno_ast::diagnostics::Diagnostic;
+use deno_config::glob::FilePatterns;
+use deno_config::glob::PathOrPatternSet;
+use deno_core::anyhow::bail;
+use deno_core::anyhow::Context;
+use deno_core::error::AnyError;
+use deno_core::serde_json;
+use deno_doc as doc;
+use deno_doc::html::UrlResolveKind;
+use deno_doc::html::UsageComposer;
+use deno_doc::html::UsageComposerEntry;
+use deno_graph::source::NullFileSystem;
+use deno_graph::EsParser;
+use deno_graph::GraphKind;
+use deno_graph::ModuleAnalyzer;
+use deno_graph::ModuleSpecifier;
+use doc::html::ShortPath;
+use doc::DocDiagnostic;
+use indexmap::IndexMap;
 
 use crate::args::DocFlags;
 use crate::args::DocHtmlFlag;
@@ -10,30 +34,14 @@ use crate::factory::CliFactory;
 use crate::graph_util::graph_exit_integrity_errors;
 use crate::graph_util::graph_walk_errors;
 use crate::graph_util::GraphWalkErrorsOptions;
+use crate::sys::CliSys;
 use crate::tsc::get_types_declaration_file_text;
 use crate::util::fs::collect_specifiers;
-use deno_ast::diagnostics::Diagnostic;
-use deno_config::glob::FilePatterns;
-use deno_config::glob::PathOrPatternSet;
-use deno_core::anyhow::bail;
-use deno_core::anyhow::Context;
-use deno_core::error::AnyError;
-use deno_core::serde_json;
-use deno_doc as doc;
-use deno_doc::html::UrlResolveKind;
-use deno_graph::source::NullFileSystem;
-use deno_graph::EsParser;
-use deno_graph::GraphKind;
-use deno_graph::ModuleAnalyzer;
-use deno_graph::ModuleSpecifier;
-use doc::html::ShortPath;
-use doc::DocDiagnostic;
-use indexmap::IndexMap;
-use std::collections::BTreeMap;
-use std::rc::Rc;
-use std::sync::Arc;
 
 const JSON_SCHEMA_VERSION: u8 = 1;
+
+const PRISM_CSS: &str = include_str!("./doc/prism.css");
+const PRISM_JS: &str = include_str!("./doc/prism.js");
 
 async fn generate_doc_nodes_for_builtin_types(
   doc_flags: DocFlags,
@@ -109,7 +117,7 @@ pub async fn doc(
     }
     DocSourceFileFlag::Paths(ref source_files) => {
       let module_graph_creator = factory.module_graph_creator().await?;
-      let fs = factory.fs();
+      let sys = CliSys::default();
 
       let module_specifiers = collect_specifiers(
         FilePatterns {
@@ -126,13 +134,17 @@ pub async fn doc(
         |_| true,
       )?;
       let graph = module_graph_creator
-        .create_graph(GraphKind::TypesOnly, module_specifiers.clone())
+        .create_graph(
+          GraphKind::TypesOnly,
+          module_specifiers.clone(),
+          crate::graph_util::NpmCachingStrategy::Eager,
+        )
         .await?;
 
       graph_exit_integrity_errors(&graph);
       let errors = graph_walk_errors(
         &graph,
-        fs,
+        &sys,
         &module_specifiers,
         GraphWalkErrorsOptions {
           check_js: false,
@@ -204,9 +216,13 @@ pub async fn doc(
       Default::default()
     };
 
+    let mut main_entrypoint = None;
+
     let rewrite_map =
       if let Some(config_file) = cli_options.start_dir.maybe_deno_json() {
         let config = config_file.to_exports_config()?;
+
+        main_entrypoint = config.get_resolved(".").ok().flatten();
 
         let rewrite_map = config
           .clone()
@@ -235,6 +251,7 @@ pub async fn doc(
       html_options,
       deno_ns,
       rewrite_map,
+      main_entrypoint,
     )
   } else {
     let modules_len = doc_nodes_by_url.len();
@@ -312,10 +329,6 @@ impl deno_doc::html::HrefResolver for DocResolver {
     None
   }
 
-  fn resolve_usage(&self, current_resolve: UrlResolveKind) -> Option<String> {
-    current_resolve.get_file().map(|file| file.path.to_string())
-  }
-
   fn resolve_source(&self, location: &deno_doc::Location) -> Option<String> {
     Some(location.filename.to_string())
   }
@@ -333,14 +346,14 @@ impl deno_doc::html::HrefResolver for DocResolver {
           let name = &res.req().name;
           Some((
             format!("https://www.npmjs.com/package/{name}"),
-            name.to_owned(),
+            name.to_string(),
           ))
         }
         "jsr" => {
           let res =
             deno_semver::jsr::JsrPackageReqReference::from_str(module).ok()?;
           let name = &res.req().name;
-          Some((format!("https://jsr.io/{name}"), name.to_owned()))
+          Some((format!("https://jsr.io/{name}"), name.to_string()))
         }
         _ => None,
       }
@@ -350,105 +363,30 @@ impl deno_doc::html::HrefResolver for DocResolver {
   }
 }
 
-struct DenoDocResolver(bool);
+struct DocComposer;
 
-impl deno_doc::html::HrefResolver for DenoDocResolver {
-  fn resolve_path(
+impl UsageComposer for DocComposer {
+  fn is_single_mode(&self) -> bool {
+    true
+  }
+
+  fn compose(
     &self,
-    current: UrlResolveKind,
-    target: UrlResolveKind,
-  ) -> String {
-    let path = deno_doc::html::href_path_resolve(current, target);
-    if self.0 {
-      if let Some(path) = path
-        .strip_suffix("index.html")
-        .or_else(|| path.strip_suffix(".html"))
-      {
-        return path.to_owned();
-      }
-    }
-
-    path
-  }
-
-  fn resolve_global_symbol(&self, _symbol: &[String]) -> Option<String> {
-    None
-  }
-
-  fn resolve_import_href(
-    &self,
-    _symbol: &[String],
-    _src: &str,
-  ) -> Option<String> {
-    None
-  }
-
-  fn resolve_usage(&self, _current_resolve: UrlResolveKind) -> Option<String> {
-    None
-  }
-
-  fn resolve_source(&self, _location: &deno_doc::Location) -> Option<String> {
-    None
-  }
-
-  fn resolve_external_jsdoc_module(
-    &self,
-    _module: &str,
-    _symbol: Option<&str>,
-  ) -> Option<(String, String)> {
-    None
-  }
-}
-
-struct NodeDocResolver(bool);
-
-impl deno_doc::html::HrefResolver for NodeDocResolver {
-  fn resolve_path(
-    &self,
-    current: UrlResolveKind,
-    target: UrlResolveKind,
-  ) -> String {
-    let path = deno_doc::html::href_path_resolve(current, target);
-    if self.0 {
-      if let Some(path) = path
-        .strip_suffix("index.html")
-        .or_else(|| path.strip_suffix(".html"))
-      {
-        return path.to_owned();
-      }
-    }
-
-    path
-  }
-
-  fn resolve_global_symbol(&self, _symbol: &[String]) -> Option<String> {
-    None
-  }
-
-  fn resolve_import_href(
-    &self,
-    _symbol: &[String],
-    _src: &str,
-  ) -> Option<String> {
-    None
-  }
-
-  fn resolve_usage(&self, current_resolve: UrlResolveKind) -> Option<String> {
+    current_resolve: UrlResolveKind,
+    usage_to_md: deno_doc::html::UsageToMd,
+  ) -> IndexMap<UsageComposerEntry, String> {
     current_resolve
       .get_file()
-      .map(|file| format!("node:{}", file.path))
-  }
-
-  fn resolve_source(&self, _location: &deno_doc::Location) -> Option<String> {
-    None
-  }
-
-  fn resolve_external_jsdoc_module(
-    &self,
-    _module: &str,
-    _symbol: Option<&str>,
-  ) -> Option<(String, String)> {
-    None
+      .map(|current_file| {
+        IndexMap::from([(
+          UsageComposerEntry {
+            name: "".to_string(),
+            icon: None,
+          },
+          usage_to_md(current_file.path.as_str(), None),
+        )])
+      })
+      .unwrap_or_default()
   }
 }
 
@@ -457,34 +395,15 @@ fn generate_docs_directory(
   html_options: &DocHtmlFlag,
   deno_ns: std::collections::HashMap<Vec<String>, Option<Rc<ShortPath>>>,
   rewrite_map: Option<IndexMap<ModuleSpecifier, String>>,
+  main_entrypoint: Option<ModuleSpecifier>,
 ) -> Result<(), AnyError> {
   let cwd = std::env::current_dir().context("Failed to get CWD")?;
   let output_dir_resolved = cwd.join(&html_options.output);
 
-  let internal_env = std::env::var("DENO_INTERNAL_HTML_DOCS").ok();
-
-  let href_resolver: Rc<dyn deno_doc::html::HrefResolver> = if internal_env
-    .as_ref()
-    .is_some_and(|internal_html_docs| internal_html_docs == "node")
-  {
-    Rc::new(NodeDocResolver(html_options.strip_trailing_html))
-  } else if internal_env
-    .as_ref()
-    .is_some_and(|internal_html_docs| internal_html_docs == "deno")
-    || deno_ns.is_empty()
-  {
-    Rc::new(DenoDocResolver(html_options.strip_trailing_html))
-  } else {
-    Rc::new(DocResolver {
-      deno_ns,
-      strip_trailing_html: html_options.strip_trailing_html,
-    })
-  };
-
   let category_docs =
     if let Some(category_docs_path) = &html_options.category_docs_path {
       let content = std::fs::read(category_docs_path)?;
-      Some(deno_core::serde_json::from_slice(&content)?)
+      Some(serde_json::from_slice(&content)?)
     } else {
       None
     };
@@ -493,7 +412,7 @@ fn generate_docs_directory(
     &html_options.symbol_redirect_map_path
   {
     let content = std::fs::read(symbol_redirect_map_path)?;
-    Some(deno_core::serde_json::from_slice(&content)?)
+    Some(serde_json::from_slice(&content)?)
   } else {
     None
   };
@@ -502,25 +421,41 @@ fn generate_docs_directory(
     &html_options.default_symbol_map_path
   {
     let content = std::fs::read(default_symbol_map_path)?;
-    Some(deno_core::serde_json::from_slice(&content)?)
+    Some(serde_json::from_slice(&content)?)
   } else {
     None
   };
 
   let options = deno_doc::html::GenerateOptions {
     package_name: html_options.name.clone(),
-    main_entrypoint: None,
+    main_entrypoint,
     rewrite_map,
-    href_resolver,
-    usage_composer: None,
+    href_resolver: Rc::new(DocResolver {
+      deno_ns,
+      strip_trailing_html: html_options.strip_trailing_html,
+    }),
+    usage_composer: Rc::new(DocComposer),
     category_docs,
-    disable_search: internal_env.is_some(),
+    disable_search: false,
     symbol_redirect_map,
     default_symbol_map,
+    markdown_renderer: deno_doc::html::comrak::create_renderer(
+      None, None, None,
+    ),
+    markdown_stripper: Rc::new(deno_doc::html::comrak::strip),
+    head_inject: Some(Rc::new(|root| {
+      format!(
+        r#"<link href="{root}{}" rel="stylesheet" /><link href="{root}prism.css" rel="stylesheet" /><script src="{root}prism.js"></script>"#,
+        deno_doc::html::comrak::COMRAK_STYLESHEET_FILENAME
+      )
+    })),
   };
 
-  let files = deno_doc::html::generate(options, doc_nodes_by_url)
+  let mut files = deno_doc::html::generate(options, doc_nodes_by_url)
     .context("Failed to generate HTML documentation")?;
+
+  files.insert("prism.js".to_string(), PRISM_JS.to_string());
+  files.insert("prism.css".to_string(), PRISM_CSS.to_string());
 
   let path = &output_dir_resolved;
   let _ = std::fs::remove_dir_all(path);

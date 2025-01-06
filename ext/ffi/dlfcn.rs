@@ -1,11 +1,11 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use crate::ir::out_buffer_as_ptr;
-use crate::symbol::NativeType;
-use crate::symbol::Symbol;
-use crate::turbocall;
-use crate::turbocall::Turbocall;
-use crate::FfiPermissions;
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::collections::HashMap;
+use std::ffi::c_void;
+use std::rc::Rc;
+
 use deno_core::op2;
 use deno_core::v8;
 use deno_core::GarbageCollected;
@@ -14,10 +14,13 @@ use deno_core::Resource;
 use dlopen2::raw::Library;
 use serde::Deserialize;
 use serde_value::ValueDeserializer;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::ffi::c_void;
-use std::rc::Rc;
+
+use crate::ir::out_buffer_as_ptr;
+use crate::symbol::NativeType;
+use crate::symbol::Symbol;
+use crate::turbocall;
+use crate::turbocall::Turbocall;
+use crate::FfiPermissions;
 
 #[derive(Debug, thiserror::Error)]
 pub enum DlfcnError {
@@ -123,17 +126,20 @@ pub struct FfiLoadArgs {
   symbols: HashMap<String, ForeignSymbol>,
 }
 
-#[op2]
+#[op2(stack_trace)]
 pub fn op_ffi_load<'scope, FP>(
   scope: &mut v8::HandleScope<'scope>,
-  state: &mut OpState,
+  state: Rc<RefCell<OpState>>,
   #[serde] args: FfiLoadArgs,
 ) -> Result<v8::Local<'scope, v8::Value>, DlfcnError>
 where
   FP: FfiPermissions + 'static,
 {
-  let permissions = state.borrow_mut::<FP>();
-  let path = permissions.check_partial_with_path(&args.path)?;
+  let path = {
+    let mut state = state.borrow_mut();
+    let permissions = state.borrow_mut::<FP>();
+    permissions.check_partial_with_path(&args.path)?
+  };
 
   let lib = Library::open(&path).map_err(|e| {
     dlopen2::Error::OpeningLibraryError(std::io::Error::new(
@@ -215,6 +221,7 @@ where
     }
   }
 
+  let mut state = state.borrow_mut();
   let out = v8::Array::new(scope, 2);
   let rid = state.resource_table.add(resource);
   let rid_v8 = v8::Integer::new_from_unsigned(scope, rid);
@@ -319,6 +326,7 @@ pub(crate) fn format_error(
     // https://github.com/denoland/deno/issues/11632
     dlopen2::Error::OpeningLibraryError(e) => {
       use std::os::windows::ffi::OsStrExt;
+
       use winapi::shared::minwindef::DWORD;
       use winapi::shared::winerror::ERROR_INSUFFICIENT_BUFFER;
       use winapi::um::errhandlingapi::GetLastError;
@@ -387,10 +395,11 @@ pub(crate) fn format_error(
 
 #[cfg(test)]
 mod tests {
+  use serde_json::json;
+
   use super::ForeignFunction;
   use super::ForeignSymbol;
   use crate::symbol::NativeType;
-  use serde_json::json;
 
   #[cfg(target_os = "windows")]
   #[test]

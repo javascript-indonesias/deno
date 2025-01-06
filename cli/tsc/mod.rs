@@ -1,15 +1,11 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
-use crate::args::TsConfig;
-use crate::args::TypeCheckMode;
-use crate::cache::FastInsecureHasher;
-use crate::cache::ModuleInfoCache;
-use crate::node;
-use crate::npm::CliNpmResolver;
-use crate::resolver::CjsTracker;
-use crate::util::checksum;
-use crate::util::path::mapped_specifier_for_tsc;
-use crate::worker::create_isolate_create_params;
+use std::borrow::Cow;
+use std::collections::HashMap;
+use std::fmt;
+use std::path::Path;
+use std::path::PathBuf;
+use std::sync::Arc;
 
 use deno_ast::MediaType;
 use deno_core::anyhow::anyhow;
@@ -35,22 +31,27 @@ use deno_graph::Module;
 use deno_graph::ModuleGraph;
 use deno_graph::ResolutionResolved;
 use deno_resolver::npm::ResolvePkgFolderFromDenoReqError;
-use deno_runtime::deno_fs;
-use deno_runtime::deno_node::NodeResolver;
 use deno_semver::npm::NpmPackageReqReference;
 use node_resolver::errors::NodeJsErrorCode;
 use node_resolver::errors::NodeJsErrorCoded;
 use node_resolver::errors::PackageSubpathResolveError;
-use node_resolver::NodeModuleKind;
-use node_resolver::NodeResolutionMode;
+use node_resolver::resolve_specifier_into_node_modules;
+use node_resolver::NodeResolutionKind;
+use node_resolver::ResolutionMode;
 use once_cell::sync::Lazy;
-use std::borrow::Cow;
-use std::collections::HashMap;
-use std::fmt;
-use std::path::Path;
-use std::path::PathBuf;
-use std::sync::Arc;
 use thiserror::Error;
+
+use crate::args::TsConfig;
+use crate::args::TypeCheckMode;
+use crate::cache::FastInsecureHasher;
+use crate::cache::ModuleInfoCache;
+use crate::node::CliNodeResolver;
+use crate::npm::CliNpmResolver;
+use crate::resolver::CjsTracker;
+use crate::sys::CliSys;
+use crate::util::checksum;
+use crate::util::path::mapped_specifier_for_tsc;
+use crate::worker::create_isolate_create_params;
 
 mod diagnostics;
 
@@ -128,6 +129,7 @@ fn get_asset_texts_from_new_runtime() -> Result<Vec<AssetText>, AnyError> {
       op_emit,
       op_is_node_file,
       op_load,
+      op_remap_specifier,
       op_resolve,
       op_respond,
     ]
@@ -274,30 +276,6 @@ fn hash_url(specifier: &ModuleSpecifier, media_type: MediaType) -> String {
   )
 }
 
-/// If the provided URLs derivable tsc media type doesn't match the media type,
-/// we will add an extension to the output.  This is to avoid issues with
-/// specifiers that don't have extensions, that tsc refuses to emit because they
-/// think a `.js` version exists, when it doesn't.
-fn maybe_remap_specifier(
-  specifier: &ModuleSpecifier,
-  media_type: MediaType,
-) -> Option<String> {
-  let path = if specifier.scheme() == "file" {
-    if let Ok(path) = specifier.to_file_path() {
-      path
-    } else {
-      PathBuf::from(specifier.path())
-    }
-  } else {
-    PathBuf::from(specifier.path())
-  };
-  if path.extension().is_none() {
-    Some(format!("{}{}", specifier, media_type.as_ts_extension()))
-  } else {
-    None
-  }
-}
-
 #[derive(Debug, Clone, Default, Eq, PartialEq)]
 pub struct EmittedFile {
   pub data: String,
@@ -315,7 +293,7 @@ pub fn into_specifier_and_media_type(
       (specifier, media_type)
     }
     None => (
-      Url::parse("internal:///missing_dependency.d.ts").unwrap(),
+      Url::parse(MISSING_DEPENDENCY_SPECIFIER).unwrap(),
       MediaType::Dts,
     ),
   }
@@ -380,7 +358,7 @@ impl TypeCheckingCjsTracker {
 #[derive(Debug)]
 pub struct RequestNpmState {
   pub cjs_tracker: Arc<TypeCheckingCjsTracker>,
-  pub node_resolver: Arc<NodeResolver>,
+  pub node_resolver: Arc<CliNodeResolver>,
   pub npm_resolver: Arc<dyn CliNpmResolver>,
 }
 
@@ -421,6 +399,8 @@ struct State {
   maybe_tsbuildinfo: Option<String>,
   maybe_response: Option<RespondArgs>,
   maybe_npm: Option<RequestNpmState>,
+  // todo(dsherret): it looks like the remapped_specifiers and
+  // root_map could be combined... what is the point of the separation?
   remapped_specifiers: HashMap<String, ModuleSpecifier>,
   root_map: HashMap<String, ModuleSpecifier>,
   current_dir: PathBuf,
@@ -461,6 +441,16 @@ impl State {
       root_map,
       current_dir,
     }
+  }
+
+  pub fn maybe_remapped_specifier(
+    &self,
+    specifier: &str,
+  ) -> Option<&ModuleSpecifier> {
+    self
+      .remapped_specifiers
+      .get(specifier)
+      .or_else(|| self.root_map.get(specifier))
   }
 }
 
@@ -606,10 +596,7 @@ fn op_load_inner(
     maybe_source.map(Cow::Borrowed)
   } else {
     let specifier = if let Some(remapped_specifier) =
-      state.remapped_specifiers.get(load_specifier)
-    {
-      remapped_specifier
-    } else if let Some(remapped_specifier) = state.root_map.get(load_specifier)
+      state.maybe_remapped_specifier(load_specifier)
     {
       remapped_specifier
     } else {
@@ -650,19 +637,27 @@ fn op_load_inner(
           media_type = MediaType::Json;
           Some(Cow::Borrowed(&*module.source))
         }
+        Module::Wasm(module) => {
+          media_type = MediaType::Dts;
+          Some(Cow::Borrowed(&*module.source_dts))
+        }
         Module::Npm(_) | Module::Node(_) => None,
         Module::External(module) => {
-          // means it's Deno code importing an npm module
-          let specifier = node::resolve_specifier_into_node_modules(
-            &module.specifier,
-            &deno_fs::RealFs,
-          );
-          Some(Cow::Owned(load_from_node_modules(
-            &specifier,
-            state.maybe_npm.as_ref(),
-            &mut media_type,
-            &mut is_cjs,
-          )?))
+          if module.specifier.scheme() != "file" {
+            None
+          } else {
+            // means it's Deno code importing an npm module
+            let specifier = resolve_specifier_into_node_modules(
+              &CliSys::default(),
+              &module.specifier,
+            );
+            Some(Cow::Owned(load_from_node_modules(
+              &specifier,
+              state.maybe_npm.as_ref(),
+              &mut media_type,
+              &mut is_cjs,
+            )?))
+          }
         }
       }
     } else if let Some(npm) = state
@@ -699,10 +694,21 @@ pub struct ResolveArgs {
   /// The base specifier that the supplied specifier strings should be resolved
   /// relative to.
   pub base: String,
-  /// If the base is cjs.
-  pub is_base_cjs: bool,
   /// A list of specifiers that should be resolved.
-  pub specifiers: Vec<String>,
+  /// (is_cjs: bool, raw_specifier: String)
+  pub specifiers: Vec<(bool, String)>,
+}
+
+#[op2]
+#[string]
+fn op_remap_specifier(
+  state: &mut OpState,
+  #[string] specifier: &str,
+) -> Option<String> {
+  let state = state.borrow::<State>();
+  state
+    .maybe_remapped_specifier(specifier)
+    .map(|url| url.to_string())
 }
 
 #[op2]
@@ -710,17 +716,9 @@ pub struct ResolveArgs {
 fn op_resolve(
   state: &mut OpState,
   #[string] base: String,
-  is_base_cjs: bool,
-  #[serde] specifiers: Vec<String>,
+  #[serde] specifiers: Vec<(bool, String)>,
 ) -> Result<Vec<(String, &'static str)>, AnyError> {
-  op_resolve_inner(
-    state,
-    ResolveArgs {
-      base,
-      is_base_cjs,
-      specifiers,
-    },
-  )
+  op_resolve_inner(state, ResolveArgs { base, specifiers })
 }
 
 #[inline]
@@ -731,24 +729,17 @@ fn op_resolve_inner(
   let state = state.borrow_mut::<State>();
   let mut resolved: Vec<(String, &'static str)> =
     Vec::with_capacity(args.specifiers.len());
-  let referrer_kind = if args.is_base_cjs {
-    NodeModuleKind::Cjs
-  } else {
-    NodeModuleKind::Esm
-  };
   let referrer = if let Some(remapped_specifier) =
-    state.remapped_specifiers.get(&args.base)
+    state.maybe_remapped_specifier(&args.base)
   {
     remapped_specifier.clone()
-  } else if let Some(remapped_base) = state.root_map.get(&args.base) {
-    remapped_base.clone()
   } else {
     normalize_specifier(&args.base, &state.current_dir).context(
       "Error converting a string module specifier for \"op_resolve\".",
     )?
   };
   let referrer_module = state.graph.get(&referrer);
-  for specifier in args.specifiers {
+  for (is_cjs, specifier) in args.specifiers {
     if specifier.starts_with("node:") {
       resolved.push((
         MISSING_DEPENDENCY_SPECIFIER.to_string(),
@@ -764,16 +755,27 @@ fn op_resolve_inner(
     }
 
     let resolved_dep = referrer_module
-      .and_then(|m| m.js())
-      .and_then(|m| m.dependencies_prefer_fast_check().get(&specifier))
+      .and_then(|m| match m {
+        Module::Js(m) => m.dependencies_prefer_fast_check().get(&specifier),
+        Module::Json(_) => None,
+        Module::Wasm(m) => m.dependencies.get(&specifier),
+        Module::Npm(_) | Module::Node(_) | Module::External(_) => None,
+      })
       .and_then(|d| d.maybe_type.ok().or_else(|| d.maybe_code.ok()));
+    let resolution_mode = if is_cjs {
+      ResolutionMode::Require
+    } else {
+      ResolutionMode::Import
+    };
 
     let maybe_result = match resolved_dep {
       Some(ResolutionResolved { specifier, .. }) => {
         resolve_graph_specifier_types(
           specifier,
           &referrer,
-          referrer_kind,
+          // we could get this from the resolved dep, but for now assume
+          // the value resolved in TypeScript is better
+          resolution_mode,
           state,
         )?
       }
@@ -781,7 +783,7 @@ fn op_resolve_inner(
         match resolve_non_graph_specifier_types(
           &specifier,
           &referrer,
-          referrer_kind,
+          resolution_mode,
           state,
         ) {
           Ok(maybe_result) => maybe_result,
@@ -814,7 +816,7 @@ fn op_resolve_inner(
           }
           _ => {
             if let Some(specifier_str) =
-              maybe_remap_specifier(&specifier, media_type)
+              mapped_specifier_for_tsc(&specifier, media_type)
             {
               state
                 .remapped_specifiers
@@ -838,7 +840,7 @@ fn op_resolve_inner(
         MediaType::Dts.as_ts_extension(),
       ),
     };
-    log::debug!("Resolved {} to {:?}", specifier, result);
+    log::debug!("Resolved {} from {} to {:?}", specifier, referrer, result);
     resolved.push(result);
   }
 
@@ -848,7 +850,7 @@ fn op_resolve_inner(
 fn resolve_graph_specifier_types(
   specifier: &ModuleSpecifier,
   referrer: &ModuleSpecifier,
-  referrer_kind: NodeModuleKind,
+  resolution_mode: ResolutionMode,
   state: &State,
 ) -> Result<Option<(ModuleSpecifier, MediaType)>, AnyError> {
   let graph = &state.graph;
@@ -889,6 +891,9 @@ fn resolve_graph_specifier_types(
     Some(Module::Json(module)) => {
       Ok(Some((module.specifier.clone(), module.media_type)))
     }
+    Some(Module::Wasm(module)) => {
+      Ok(Some((module.specifier.clone(), MediaType::Dmts)))
+    }
     Some(Module::Npm(module)) => {
       if let Some(npm) = &state.maybe_npm.as_ref() {
         let package_folder = npm
@@ -901,8 +906,8 @@ fn resolve_graph_specifier_types(
             &package_folder,
             module.nv_reference.sub_path(),
             Some(referrer),
-            referrer_kind,
-            NodeResolutionMode::Types,
+            resolution_mode,
+            NodeResolutionKind::Types,
           );
         let maybe_url = match res_result {
           Ok(url) => Some(url),
@@ -920,9 +925,9 @@ fn resolve_graph_specifier_types(
     Some(Module::External(module)) => {
       // we currently only use "External" for when the module is in an npm package
       Ok(state.maybe_npm.as_ref().map(|_| {
-        let specifier = node::resolve_specifier_into_node_modules(
+        let specifier = resolve_specifier_into_node_modules(
+          &CliSys::default(),
           &module.specifier,
-          &deno_fs::RealFs,
         );
         into_specifier_and_media_type(Some(specifier))
       }))
@@ -942,7 +947,7 @@ enum ResolveNonGraphSpecifierTypesError {
 fn resolve_non_graph_specifier_types(
   raw_specifier: &str,
   referrer: &ModuleSpecifier,
-  referrer_kind: NodeModuleKind,
+  resolution_mode: ResolutionMode,
   state: &State,
 ) -> Result<
   Option<(ModuleSpecifier, MediaType)>,
@@ -960,8 +965,8 @@ fn resolve_non_graph_specifier_types(
         .resolve(
           raw_specifier,
           referrer,
-          referrer_kind,
-          NodeResolutionMode::Types,
+          resolution_mode,
+          NodeResolutionKind::Types,
         )
         .ok()
         .map(|res| res.into_url()),
@@ -969,7 +974,7 @@ fn resolve_non_graph_specifier_types(
   } else if let Ok(npm_req_ref) =
     NpmPackageReqReference::from_str(raw_specifier)
   {
-    debug_assert_eq!(referrer_kind, NodeModuleKind::Esm);
+    debug_assert_eq!(resolution_mode, ResolutionMode::Import);
     // todo(dsherret): add support for injecting this in the graph so
     // we don't need this special code here.
     // This could occur when resolving npm:@types/node when it is
@@ -981,8 +986,8 @@ fn resolve_non_graph_specifier_types(
       &package_folder,
       npm_req_ref.sub_path(),
       Some(referrer),
-      referrer_kind,
-      NodeResolutionMode::Types,
+      resolution_mode,
+      NodeResolutionKind::Types,
     );
     let maybe_url = match res_result {
       Ok(url) => Some(url),
@@ -1067,6 +1072,7 @@ pub fn exec(request: Request) -> Result<Response, AnyError> {
       op_emit,
       op_is_node_file,
       op_load,
+      op_remap_specifier,
       op_resolve,
       op_respond,
     ],
@@ -1132,16 +1138,17 @@ pub fn exec(request: Request) -> Result<Response, AnyError> {
 
 #[cfg(test)]
 mod tests {
-  use super::Diagnostic;
-  use super::DiagnosticCategory;
-  use super::*;
-  use crate::args::TsConfig;
   use deno_core::futures::future;
   use deno_core::serde_json;
   use deno_core::OpState;
   use deno_graph::GraphKind;
   use deno_graph::ModuleGraph;
   use test_util::PathRef;
+
+  use super::Diagnostic;
+  use super::DiagnosticCategory;
+  use super::*;
+  use crate::args::TsConfig;
 
   #[derive(Debug, Default)]
   pub struct MockLoader {
@@ -1196,7 +1203,7 @@ mod tests {
         .context("Unable to get CWD")
         .unwrap(),
     );
-    let mut op_state = OpState::new(None);
+    let mut op_state = OpState::new(None, None);
     op_state.put(state);
     op_state
   }
@@ -1381,8 +1388,7 @@ mod tests {
       &mut state,
       ResolveArgs {
         base: "https://deno.land/x/a.ts".to_string(),
-        is_base_cjs: false,
-        specifiers: vec!["./b.ts".to_string()],
+        specifiers: vec![(false, "./b.ts".to_string())],
       },
     )
     .expect("should have invoked op");
@@ -1401,8 +1407,7 @@ mod tests {
       &mut state,
       ResolveArgs {
         base: "https://deno.land/x/a.ts".to_string(),
-        is_base_cjs: false,
-        specifiers: vec!["./bad.ts".to_string()],
+        specifiers: vec![(false, "./bad.ts".to_string())],
       },
     )
     .expect("should have not errored");
@@ -1442,6 +1447,9 @@ mod tests {
           source_line: None,
           file_name: None,
           related_information: None,
+          reports_deprecated: None,
+          reports_unnecessary: None,
+          other: Default::default(),
         }]),
         stats: Stats(vec![("a".to_string(), 12)])
       })

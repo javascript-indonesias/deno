@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use deno_core::op2;
 use deno_core::OpState;
@@ -45,7 +45,7 @@ fn kill(pid: i32, _sig: i32) -> i32 {
   }
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_node_process_kill(
   state: &mut OpState,
   #[smi] pid: i32,

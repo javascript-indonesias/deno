@@ -1,5 +1,6 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::error::Error;
 use std::fmt::Formatter;
@@ -10,16 +11,11 @@ use std::path::PathBuf;
 use std::path::StripPrefixError;
 use std::rc::Rc;
 
-use crate::interface::AccessCheckFn;
-use crate::interface::FileSystemRc;
-use crate::interface::FsDirEntry;
-use crate::interface::FsFileType;
-use crate::FsPermissions;
-use crate::OpenOptions;
 use boxed_error::Boxed;
 use deno_core::op2;
 use deno_core::CancelFuture;
 use deno_core::CancelHandle;
+use deno_core::FastString;
 use deno_core::JsBuffer;
 use deno_core::OpState;
 use deno_core::ResourceId;
@@ -32,6 +28,13 @@ use rand::rngs::ThreadRng;
 use rand::thread_rng;
 use rand::Rng;
 use serde::Serialize;
+
+use crate::interface::AccessCheckFn;
+use crate::interface::FileSystemRc;
+use crate::interface::FsDirEntry;
+use crate::interface::FsFileType;
+use crate::FsPermissions;
+use crate::OpenOptions;
 
 #[derive(Debug, Boxed)]
 pub struct FsOpsError(pub Box<FsOpsErrorKind>);
@@ -146,7 +149,7 @@ fn map_permission_error(
   }
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[string]
 pub fn op_fs_cwd<P>(state: &mut OpState) -> Result<String, FsOpsError>
 where
@@ -161,7 +164,7 @@ where
   Ok(path_str)
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_chdir<P>(
   state: &mut OpState,
   #[string] directory: &str,
@@ -188,7 +191,7 @@ where
   state.borrow::<FileSystemRc>().umask(mask).context("umask")
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[smi]
 pub fn op_fs_open_sync<P>(
   state: &mut OpState,
@@ -215,7 +218,7 @@ where
   Ok(rid)
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[smi]
 pub async fn op_fs_open_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -243,7 +246,7 @@ where
   Ok(rid)
 }
 
-#[op2]
+#[op2(stack_trace)]
 pub fn op_fs_mkdir_sync<P>(
   state: &mut OpState,
   #[string] path: String,
@@ -266,7 +269,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_mkdir_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
@@ -291,7 +294,7 @@ where
   Ok(())
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_chmod_sync<P>(
   state: &mut OpState,
   #[string] path: String,
@@ -308,7 +311,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_chmod_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
@@ -328,7 +331,7 @@ where
   Ok(())
 }
 
-#[op2]
+#[op2(stack_trace)]
 pub fn op_fs_chown_sync<P>(
   state: &mut OpState,
   #[string] path: String,
@@ -347,7 +350,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_chown_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
@@ -368,7 +371,7 @@ where
   Ok(())
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_remove_sync<P>(
   state: &mut OpState,
   #[string] path: &str,
@@ -388,7 +391,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_remove_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
@@ -419,7 +422,7 @@ where
   Ok(())
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_copy_file_sync<P>(
   state: &mut OpState,
   #[string] from: &str,
@@ -439,7 +442,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_copy_file_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] from: String,
@@ -463,7 +466,7 @@ where
   Ok(())
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_stat_sync<P>(
   state: &mut OpState,
   #[string] path: String,
@@ -482,7 +485,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[serde]
 pub async fn op_fs_stat_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -504,7 +507,7 @@ where
   Ok(SerializableStat::from(stat))
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_lstat_sync<P>(
   state: &mut OpState,
   #[string] path: String,
@@ -523,7 +526,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[serde]
 pub async fn op_fs_lstat_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -545,7 +548,7 @@ where
   Ok(SerializableStat::from(stat))
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[string]
 pub fn op_fs_realpath_sync<P>(
   state: &mut OpState,
@@ -568,7 +571,7 @@ where
   Ok(path_string)
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[string]
 pub async fn op_fs_realpath_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -596,7 +599,7 @@ where
   Ok(path_string)
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 pub fn op_fs_read_dir_sync<P>(
   state: &mut OpState,
@@ -615,7 +618,7 @@ where
   Ok(entries)
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[serde]
 pub async fn op_fs_read_dir_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -640,7 +643,7 @@ where
   Ok(entries)
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_rename_sync<P>(
   state: &mut OpState,
   #[string] oldpath: String,
@@ -661,7 +664,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_rename_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] oldpath: String,
@@ -686,7 +689,7 @@ where
   Ok(())
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_link_sync<P>(
   state: &mut OpState,
   #[string] oldpath: &str,
@@ -708,7 +711,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_link_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] oldpath: String,
@@ -734,7 +737,7 @@ where
   Ok(())
 }
 
-#[op2]
+#[op2(stack_trace)]
 pub fn op_fs_symlink_sync<P>(
   state: &mut OpState,
   #[string] oldpath: &str,
@@ -758,7 +761,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_symlink_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] oldpath: String,
@@ -786,7 +789,7 @@ where
   Ok(())
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[string]
 pub fn op_fs_read_link_sync<P>(
   state: &mut OpState,
@@ -806,7 +809,7 @@ where
   Ok(target_string)
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[string]
 pub async fn op_fs_read_link_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -831,7 +834,7 @@ where
   Ok(target_string)
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_truncate_sync<P>(
   state: &mut OpState,
   #[string] path: &str,
@@ -851,7 +854,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_truncate_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
@@ -875,7 +878,7 @@ where
   Ok(())
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_fs_utime_sync<P>(
   state: &mut OpState,
   #[string] path: &str,
@@ -896,7 +899,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_fs_utime_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
@@ -927,7 +930,7 @@ where
   Ok(())
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[string]
 pub fn op_fs_make_temp_dir_sync<P>(
   state: &mut OpState,
@@ -969,7 +972,7 @@ where
   .context("tmpdir")
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[string]
 pub async fn op_fs_make_temp_dir_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -1015,7 +1018,7 @@ where
   .context("tmpdir")
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[string]
 pub fn op_fs_make_temp_file_sync<P>(
   state: &mut OpState,
@@ -1063,7 +1066,7 @@ where
   .context("tmpfile")
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[string]
 pub async fn op_fs_make_temp_file_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -1235,7 +1238,7 @@ fn tmp_name(
   Ok(path)
 }
 
-#[op2]
+#[op2(stack_trace)]
 pub fn op_fs_write_file_sync<P>(
   state: &mut OpState,
   #[string] path: String,
@@ -1261,7 +1264,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[allow(clippy::too_many_arguments)]
 pub async fn op_fs_write_file_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -1315,7 +1318,7 @@ where
   Ok(())
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 pub fn op_fs_read_file_sync<P>(
   state: &mut OpState,
@@ -1333,10 +1336,11 @@ where
     .read_file_sync(&path, Some(&mut access_check))
     .map_err(|error| map_permission_error("readfile", error, &path))?;
 
-  Ok(buf.into())
+  // todo(https://github.com/denoland/deno/issues/27107): do not clone here
+  Ok(buf.into_owned().into_boxed_slice().into())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 #[serde]
 pub async fn op_fs_read_file_async<P>(
   state: Rc<RefCell<OpState>>,
@@ -1375,15 +1379,16 @@ where
       .map_err(|error| map_permission_error("readfile", error, &path))?
   };
 
-  Ok(buf.into())
+  // todo(https://github.com/denoland/deno/issues/27107): do not clone here
+  Ok(buf.into_owned().into_boxed_slice().into())
 }
 
-#[op2]
-#[string]
+#[op2(stack_trace)]
+#[to_v8]
 pub fn op_fs_read_file_text_sync<P>(
   state: &mut OpState,
   #[string] path: String,
-) -> Result<String, FsOpsError>
+) -> Result<FastString, FsOpsError>
 where
   P: FsPermissions + 'static,
 {
@@ -1395,17 +1400,19 @@ where
   let str = fs
     .read_text_file_lossy_sync(&path, Some(&mut access_check))
     .map_err(|error| map_permission_error("readfile", error, &path))?;
-
-  Ok(str)
+  Ok(match str {
+    Cow::Borrowed(text) => FastString::from_static(text),
+    Cow::Owned(value) => value.into(),
+  })
 }
 
-#[op2(async)]
-#[string]
+#[op2(async, stack_trace)]
+#[to_v8]
 pub async fn op_fs_read_file_text_async<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
   #[smi] cancel_rid: Option<ResourceId>,
-) -> Result<String, FsOpsError>
+) -> Result<FastString, FsOpsError>
 where
   P: FsPermissions + 'static,
 {
@@ -1439,7 +1446,10 @@ where
       .map_err(|error| map_permission_error("readfile", error, &path))?
   };
 
-  Ok(str)
+  Ok(match str {
+    Cow::Borrowed(text) => FastString::from_static(text),
+    Cow::Owned(value) => value.into(),
+  })
 }
 
 fn to_seek_from(offset: i64, whence: i32) -> Result<SeekFrom, FsOpsError> {

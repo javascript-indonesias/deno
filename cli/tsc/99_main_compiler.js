@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 // @ts-check
 /// <reference path="./compiler.d.ts" />
@@ -41,6 +41,13 @@ delete Object.prototype.__proto__;
     "listen",
     "listenDatagram",
     "openKv",
+    "connectQuic",
+    "listenQuic",
+    "QuicBidirectionalStream",
+    "QuicConn",
+    "QuicListener",
+    "QuicReceiveStream",
+    "QuicSendStream",
   ]);
   const unstableMsgSuggestion =
     "If not, try changing the 'lib' compiler option to include 'deno.unstable' " +
@@ -402,9 +409,20 @@ delete Object.prototype.__proto__;
       messageText = formatMessage(msgText, ri.code);
     }
     if (start !== undefined && length !== undefined && file) {
-      const startPos = file.getLineAndCharacterOfPosition(start);
-      const sourceLine = file.getFullText().split("\n")[startPos.line];
-      const fileName = file.fileName;
+      let startPos = file.getLineAndCharacterOfPosition(start);
+      let sourceLine = file.getFullText().split("\n")[startPos.line];
+      const originalFileName = file.fileName;
+      const fileName = ops.op_remap_specifier
+        ? (ops.op_remap_specifier(file.fileName) ?? file.fileName)
+        : file.fileName;
+      // Bit of a hack to detect when we have a .wasm file and want to hide
+      // the .d.ts text. This is not perfect, but will work in most scenarios
+      if (
+        fileName.endsWith(".wasm") && originalFileName.endsWith(".wasm.d.mts")
+      ) {
+        startPos = { line: 0, character: 0 };
+        sourceLine = undefined;
+      }
       return {
         start: startPos,
         end: file.getLineAndCharacterOfPosition(start + length),
@@ -450,6 +468,12 @@ delete Object.prototype.__proto__;
     // We specify the resolution mode to be CommonJS for some npm files and this
     // diagnostic gets generated even though we're using custom module resolution.
     1452,
+    // Module '...' cannot be imported using this construct. The specifier only resolves to an
+    // ES module, which cannot be imported with 'require'.
+    1471,
+    // TS1479: The current file is a CommonJS module whose imports will produce 'require' calls;
+    // however, the referenced file is an ECMAScript module and cannot be imported with 'require'.
+    1479,
     // TS2306: File '.../index.d.ts' is not a module.
     // We get this for `x-typescript-types` declaration files which don't export
     // anything. We prefer to treat these as modules with no exports.
@@ -462,6 +486,9 @@ delete Object.prototype.__proto__;
     2792,
     // TS2307: Cannot find module '{0}' or its corresponding type declarations.
     2307,
+    // Relative import errors to add an extension
+    2834,
+    2835,
     // TS5009: Cannot find the common subdirectory path for the input files.
     5009,
     // TS5055: Cannot write file
@@ -675,14 +702,18 @@ delete Object.prototype.__proto__;
     getNewLine() {
       return "\n";
     },
-    resolveTypeReferenceDirectives(
-      typeDirectiveNames,
+    resolveTypeReferenceDirectiveReferences(
+      typeDirectiveReferences,
       containingFilePath,
       redirectedReference,
       options,
-      containingFileMode,
+      containingSourceFile,
+      _reusedNames,
     ) {
-      return typeDirectiveNames.map((arg) => {
+      const isCjs =
+        containingSourceFile?.impliedNodeFormat === ts.ModuleKind.CommonJS;
+      /** @type {Array<ts.ResolvedTypeReferenceDirectiveWithFailedLookupLocations>} */
+      const result = typeDirectiveReferences.map((arg) => {
         /** @type {ts.FileReference} */
         const fileReference = typeof arg === "string"
           ? {
@@ -695,16 +726,28 @@ delete Object.prototype.__proto__;
           /** @type {[string, ts.Extension] | undefined} */
           const resolved = ops.op_resolve(
             containingFilePath,
-            containingFileMode === ts.ModuleKind.CommonJS,
-            [fileReference.fileName],
+            [
+              [
+                fileReference.resolutionMode == null
+                  ? isCjs
+                  : fileReference.resolutionMode === ts.ModuleKind.CommonJS,
+                fileReference.fileName,
+              ],
+            ],
           )?.[0];
           if (resolved) {
             return {
-              primary: true,
-              resolvedFileName: resolved[0],
+              resolvedTypeReferenceDirective: {
+                primary: true,
+                resolvedFileName: resolved[0],
+                // todo(dsherret): we should probably be setting this
+                isExternalLibraryImport: undefined,
+              },
             };
           } else {
-            return undefined;
+            return {
+              resolvedTypeReferenceDirective: undefined,
+            };
           }
         } else {
           return ts.resolveTypeReferenceDirective(
@@ -714,41 +757,56 @@ delete Object.prototype.__proto__;
             host,
             redirectedReference,
             undefined,
-            containingFileMode ?? fileReference.resolutionMode,
-          ).resolvedTypeReferenceDirective;
+            containingSourceFile?.impliedNodeFormat ??
+              fileReference.resolutionMode,
+          );
         }
       });
+      return result;
     },
-    resolveModuleNames(
-      specifiers,
+    resolveModuleNameLiterals(
+      moduleLiterals,
       base,
-      _reusedNames,
       _redirectedReference,
-      _options,
+      compilerOptions,
       containingSourceFile,
+      _reusedNames,
     ) {
+      const specifiers = moduleLiterals.map((literal) => [
+        ts.getModeForUsageLocation(
+          containingSourceFile,
+          literal,
+          compilerOptions,
+        ) === ts.ModuleKind.CommonJS,
+        literal.text,
+      ]);
       if (logDebug) {
         debug(`host.resolveModuleNames()`);
         debug(`  base: ${base}`);
-        debug(`  specifiers: ${specifiers.join(", ")}`);
+        debug(`  specifiers: ${specifiers.map((s) => s[1]).join(", ")}`);
       }
       /** @type {Array<[string, ts.Extension] | undefined>} */
       const resolved = ops.op_resolve(
         base,
-        containingSourceFile?.impliedNodeFormat === ts.ModuleKind.CommonJS,
         specifiers,
       );
       if (resolved) {
+        /** @type {Array<ts.ResolvedModuleWithFailedLookupLocations>} */
         const result = resolved.map((item) => {
           if (item) {
             const [resolvedFileName, extension] = item;
             return {
-              resolvedFileName,
-              extension,
-              isExternalLibraryImport: false,
+              resolvedModule: {
+                resolvedFileName,
+                extension,
+                // todo(dsherret): we should probably be setting this
+                isExternalLibraryImport: false,
+              },
             };
           }
-          return undefined;
+          return {
+            resolvedModule: undefined,
+          };
         });
         result.length = specifiers.length;
         return result;
@@ -993,24 +1051,27 @@ delete Object.prototype.__proto__;
       configFileParsingDiagnostics,
     });
 
-    const checkFiles = localOnly
-      ? rootNames
-        .filter((n) => !n.startsWith("http"))
-        .map((checkName) => {
-          const sourceFile = program.getSourceFile(checkName);
-          if (sourceFile == null) {
-            throw new Error("Could not find source file for: " + checkName);
-          }
-          return sourceFile;
-        })
-      : undefined;
+    let checkFiles = undefined;
 
-    if (checkFiles != null) {
+    if (localOnly) {
+      const checkFileNames = new Set();
+      checkFiles = [];
+
+      for (const checkName of rootNames) {
+        if (checkName.startsWith("http")) {
+          continue;
+        }
+        const sourceFile = program.getSourceFile(checkName);
+        if (sourceFile != null) {
+          checkFiles.push(sourceFile);
+        }
+        checkFileNames.add(checkName);
+      }
+
       // When calling program.getSemanticDiagnostics(...) with a source file, we
       // need to call this code first in order to get it to invalidate cached
       // diagnostics correctly. This is what program.getSemanticDiagnostics()
       // does internally when calling without any arguments.
-      const checkFileNames = new Set(checkFiles.map((f) => f.fileName));
       while (
         program.getSemanticDiagnosticsOfNextAffectedFile(
           undefined,

@@ -1,4 +1,4 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -26,7 +26,7 @@ pub enum FsError {
   Fs(#[from] deno_io::fs::FsError),
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_node_fs_exists_sync<P>(
   state: &mut OpState,
   #[string] path: String,
@@ -41,7 +41,7 @@ where
   Ok(fs.exists_sync(&path))
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_node_fs_exists<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
@@ -60,7 +60,7 @@ where
   Ok(fs.exists_async(path).await?)
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_node_cp_sync<P>(
   state: &mut OpState,
   #[string] path: &str,
@@ -81,7 +81,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_node_cp<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
@@ -117,7 +117,7 @@ pub struct StatFs {
   pub ffree: u64,
 }
 
-#[op2]
+#[op2(stack_trace)]
 #[serde]
 pub fn op_node_statfs<P>(
   state: Rc<RefCell<OpState>>,
@@ -207,6 +207,7 @@ where
   {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
+
     use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceW;
 
     let _ = bigint;
@@ -258,7 +259,7 @@ where
   }
 }
 
-#[op2(fast)]
+#[op2(fast, stack_trace)]
 pub fn op_node_lutimes_sync<P>(
   state: &mut OpState,
   #[string] path: &str,
@@ -279,7 +280,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_node_lutimes<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,
@@ -305,7 +306,7 @@ where
   Ok(())
 }
 
-#[op2]
+#[op2(stack_trace)]
 pub fn op_node_lchown_sync<P>(
   state: &mut OpState,
   #[string] path: String,
@@ -323,7 +324,7 @@ where
   Ok(())
 }
 
-#[op2(async)]
+#[op2(async, stack_trace)]
 pub async fn op_node_lchown<P>(
   state: Rc<RefCell<OpState>>,
   #[string] path: String,

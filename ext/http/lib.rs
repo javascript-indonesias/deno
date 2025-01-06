@@ -1,4 +1,20 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
+// Copyright 2018-2025 the Deno authors. MIT license.
+
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::cmp::min;
+use std::error::Error;
+use std::future::Future;
+use std::io;
+use std::io::Write;
+use std::mem::replace;
+use std::mem::take;
+use std::pin::pin;
+use std::pin::Pin;
+use std::rc::Rc;
+use std::sync::Arc;
+use std::task::Context;
+use std::task::Poll;
 
 use async_compression::tokio::write::BrotliEncoder;
 use async_compression::tokio::write::GzipEncoder;
@@ -39,6 +55,8 @@ use deno_net::raw::NetworkStream;
 use deno_websocket::ws_create_server_stream;
 use flate2::write::GzEncoder;
 use flate2::Compression;
+use hyper::server::conn::http1;
+use hyper::server::conn::http2;
 use hyper_util::rt::TokioIo;
 use hyper_v014::body::Bytes;
 use hyper_v014::body::HttpBody;
@@ -52,21 +70,6 @@ use hyper_v014::HeaderMap;
 use hyper_v014::Request;
 use hyper_v014::Response;
 use serde::Serialize;
-use std::borrow::Cow;
-use std::cell::RefCell;
-use std::cmp::min;
-use std::error::Error;
-use std::future::Future;
-use std::io;
-use std::io::Write;
-use std::mem::replace;
-use std::mem::take;
-use std::pin::pin;
-use std::pin::Pin;
-use std::rc::Rc;
-use std::sync::Arc;
-use std::task::Context;
-use std::task::Poll;
 use tokio::io::AsyncRead;
 use tokio::io::AsyncWrite;
 use tokio::io::AsyncWriteExt;
@@ -95,6 +98,25 @@ pub use request_properties::HttpPropertyExtractor;
 pub use request_properties::HttpRequestProperties;
 pub use service::UpgradeUnavailableError;
 pub use websocket_upgrade::WebSocketUpgradeError;
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct Options {
+  /// By passing a hook function, the caller can customize various configuration
+  /// options for the HTTP/2 server.
+  /// See [`http2::Builder`] for what parameters can be customized.
+  ///
+  /// If `None`, the default configuration provided by hyper will be used. Note
+  /// that the default configuration is subject to change in future versions.
+  pub http2_builder_hook:
+    Option<fn(http2::Builder<LocalExecutor>) -> http2::Builder<LocalExecutor>>,
+  /// By passing a hook function, the caller can customize various configuration
+  /// options for the HTTP/1 server.
+  /// See [`http1::Builder`] for what parameters can be customized.
+  ///
+  /// If `None`, the default configuration provided by hyper will be used. Note
+  /// that the default configuration is subject to change in future versions.
+  pub http1_builder_hook: Option<fn(http1::Builder) -> http1::Builder>,
+}
 
 deno_core::extension!(
   deno_http,
@@ -135,6 +157,12 @@ deno_core::extension!(
     http_next::op_http_cancel,
   ],
   esm = ["00_serve.ts", "01_http.js", "02_websocket.ts"],
+  options = {
+    options: Options,
+  },
+  state = |state, options| {
+    state.put::<Options>(options.options);
+  }
 );
 
 #[derive(Debug, thiserror::Error)]
@@ -1117,7 +1145,7 @@ async fn op_http_upgrade_websocket(
 
 // Needed so hyper can use non Send futures
 #[derive(Clone)]
-struct LocalExecutor;
+pub struct LocalExecutor;
 
 impl<Fut> hyper_v014::rt::Executor<Fut> for LocalExecutor
 where

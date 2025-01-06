@@ -1,23 +1,13 @@
-// Copyright 2018-2024 the Deno authors. All rights reserved. MIT license.
-use crate::compressible::is_content_compressible;
-use crate::extract_network_stream;
-use crate::network_buffered_stream::NetworkStreamPrefixCheck;
-use crate::request_body::HttpRequestBody;
-use crate::request_properties::HttpConnectionProperties;
-use crate::request_properties::HttpListenProperties;
-use crate::request_properties::HttpPropertyExtractor;
-use crate::response_body::Compression;
-use crate::response_body::ResponseBytesInner;
-use crate::service::handle_request;
-use crate::service::http_general_trace;
-use crate::service::http_trace;
-use crate::service::HttpRecord;
-use crate::service::HttpRecordResponse;
-use crate::service::HttpRequestBodyAutocloser;
-use crate::service::HttpServerState;
-use crate::service::SignallingRc;
-use crate::websocket_upgrade::WebSocketUpgrade;
-use crate::LocalExecutor;
+// Copyright 2018-2025 the Deno authors. MIT license.
+use std::borrow::Cow;
+use std::cell::RefCell;
+use std::ffi::c_void;
+use std::future::Future;
+use std::io;
+use std::pin::Pin;
+use std::ptr::null;
+use std::rc::Rc;
+
 use cache_control::CacheControl;
 use deno_core::external;
 use deno_core::futures::future::poll_fn;
@@ -43,6 +33,7 @@ use deno_core::ResourceId;
 use deno_net::ops_tls::TlsStream;
 use deno_net::raw::NetworkStream;
 use deno_websocket::ws_create_server_stream;
+use fly_accept_encoding::Encoding;
 use hyper::body::Incoming;
 use hyper::header::HeaderMap;
 use hyper::header::ACCEPT_ENCODING;
@@ -62,20 +53,30 @@ use hyper::StatusCode;
 use hyper_util::rt::TokioIo;
 use once_cell::sync::Lazy;
 use smallvec::SmallVec;
-use std::borrow::Cow;
-use std::cell::RefCell;
-use std::ffi::c_void;
-use std::future::Future;
-use std::io;
-use std::pin::Pin;
-use std::ptr::null;
-use std::rc::Rc;
-
-use super::fly_accept_encoding;
-use fly_accept_encoding::Encoding;
-
 use tokio::io::AsyncReadExt;
 use tokio::io::AsyncWriteExt;
+
+use super::fly_accept_encoding;
+use crate::compressible::is_content_compressible;
+use crate::extract_network_stream;
+use crate::network_buffered_stream::NetworkStreamPrefixCheck;
+use crate::request_body::HttpRequestBody;
+use crate::request_properties::HttpConnectionProperties;
+use crate::request_properties::HttpListenProperties;
+use crate::request_properties::HttpPropertyExtractor;
+use crate::response_body::Compression;
+use crate::response_body::ResponseBytesInner;
+use crate::service::handle_request;
+use crate::service::http_general_trace;
+use crate::service::http_trace;
+use crate::service::HttpRecord;
+use crate::service::HttpRecordResponse;
+use crate::service::HttpRequestBodyAutocloser;
+use crate::service::HttpServerState;
+use crate::service::SignallingRc;
+use crate::websocket_upgrade::WebSocketUpgrade;
+use crate::LocalExecutor;
+use crate::Options;
 
 type Request = hyper::Request<Incoming>;
 
@@ -821,10 +822,16 @@ fn serve_http11_unconditional(
   io: impl HttpServeStream,
   svc: impl HttpService<Incoming, ResBody = HttpRecordResponse> + 'static,
   cancel: Rc<CancelHandle>,
+  http1_builder_hook: Option<fn(http1::Builder) -> http1::Builder>,
 ) -> impl Future<Output = Result<(), hyper::Error>> + 'static {
-  let conn = http1::Builder::new()
-    .keep_alive(true)
-    .writev(*USE_WRITEV)
+  let mut builder = http1::Builder::new();
+  builder.keep_alive(true).writev(*USE_WRITEV);
+
+  if let Some(http1_builder_hook) = http1_builder_hook {
+    builder = http1_builder_hook(builder);
+  }
+
+  let conn = builder
     .serve_connection(TokioIo::new(io), svc)
     .with_upgrades();
 
@@ -843,9 +850,17 @@ fn serve_http2_unconditional(
   io: impl HttpServeStream,
   svc: impl HttpService<Incoming, ResBody = HttpRecordResponse> + 'static,
   cancel: Rc<CancelHandle>,
+  http2_builder_hook: Option<
+    fn(http2::Builder<LocalExecutor>) -> http2::Builder<LocalExecutor>,
+  >,
 ) -> impl Future<Output = Result<(), hyper::Error>> + 'static {
-  let conn =
-    http2::Builder::new(LocalExecutor).serve_connection(TokioIo::new(io), svc);
+  let mut builder = http2::Builder::new(LocalExecutor);
+
+  if let Some(http2_builder_hook) = http2_builder_hook {
+    builder = http2_builder_hook(builder);
+  }
+
+  let conn = builder.serve_connection(TokioIo::new(io), svc);
   async {
     match conn.or_abort(cancel).await {
       Err(mut conn) => {
@@ -861,15 +876,16 @@ async fn serve_http2_autodetect(
   io: impl HttpServeStream,
   svc: impl HttpService<Incoming, ResBody = HttpRecordResponse> + 'static,
   cancel: Rc<CancelHandle>,
+  options: Options,
 ) -> Result<(), HttpNextError> {
   let prefix = NetworkStreamPrefixCheck::new(io, HTTP2_PREFIX);
   let (matches, io) = prefix.match_prefix().await?;
   if matches {
-    serve_http2_unconditional(io, svc, cancel)
+    serve_http2_unconditional(io, svc, cancel, options.http2_builder_hook)
       .await
       .map_err(HttpNextError::Hyper)
   } else {
-    serve_http11_unconditional(io, svc, cancel)
+    serve_http11_unconditional(io, svc, cancel, options.http1_builder_hook)
       .await
       .map_err(HttpNextError::Hyper)
   }
@@ -880,6 +896,7 @@ fn serve_https(
   request_info: HttpConnectionProperties,
   lifetime: HttpLifetime,
   tx: tokio::sync::mpsc::Sender<Rc<HttpRecord>>,
+  options: Options,
 ) -> JoinHandle<Result<(), HttpNextError>> {
   let HttpLifetime {
     server_state,
@@ -891,21 +908,31 @@ fn serve_https(
     handle_request(req, request_info.clone(), server_state.clone(), tx.clone())
   });
   spawn(
-    async {
+    async move {
       let handshake = io.handshake().await?;
       // If the client specifically negotiates a protocol, we will use it. If not, we'll auto-detect
       // based on the prefix bytes
       let handshake = handshake.alpn;
       if Some(TLS_ALPN_HTTP_2) == handshake.as_deref() {
-        serve_http2_unconditional(io, svc, listen_cancel_handle)
-          .await
-          .map_err(HttpNextError::Hyper)
+        serve_http2_unconditional(
+          io,
+          svc,
+          listen_cancel_handle,
+          options.http2_builder_hook,
+        )
+        .await
+        .map_err(HttpNextError::Hyper)
       } else if Some(TLS_ALPN_HTTP_11) == handshake.as_deref() {
-        serve_http11_unconditional(io, svc, listen_cancel_handle)
-          .await
-          .map_err(HttpNextError::Hyper)
+        serve_http11_unconditional(
+          io,
+          svc,
+          listen_cancel_handle,
+          options.http1_builder_hook,
+        )
+        .await
+        .map_err(HttpNextError::Hyper)
       } else {
-        serve_http2_autodetect(io, svc, listen_cancel_handle).await
+        serve_http2_autodetect(io, svc, listen_cancel_handle, options).await
       }
     }
     .try_or_cancel(connection_cancel_handle),
@@ -917,6 +944,7 @@ fn serve_http(
   request_info: HttpConnectionProperties,
   lifetime: HttpLifetime,
   tx: tokio::sync::mpsc::Sender<Rc<HttpRecord>>,
+  options: Options,
 ) -> JoinHandle<Result<(), HttpNextError>> {
   let HttpLifetime {
     server_state,
@@ -928,7 +956,7 @@ fn serve_http(
     handle_request(req, request_info.clone(), server_state.clone(), tx.clone())
   });
   spawn(
-    serve_http2_autodetect(io, svc, listen_cancel_handle)
+    serve_http2_autodetect(io, svc, listen_cancel_handle, options)
       .try_or_cancel(connection_cancel_handle),
   )
 }
@@ -938,6 +966,7 @@ fn serve_http_on<HTTP>(
   listen_properties: &HttpListenProperties,
   lifetime: HttpLifetime,
   tx: tokio::sync::mpsc::Sender<Rc<HttpRecord>>,
+  options: Options,
 ) -> JoinHandle<Result<(), HttpNextError>>
 where
   HTTP: HttpPropertyExtractor,
@@ -949,14 +978,14 @@ where
 
   match network_stream {
     NetworkStream::Tcp(conn) => {
-      serve_http(conn, connection_properties, lifetime, tx)
+      serve_http(conn, connection_properties, lifetime, tx, options)
     }
     NetworkStream::Tls(conn) => {
-      serve_https(conn, connection_properties, lifetime, tx)
+      serve_https(conn, connection_properties, lifetime, tx, options)
     }
     #[cfg(unix)]
     NetworkStream::Unix(conn) => {
-      serve_http(conn, connection_properties, lifetime, tx)
+      serve_http(conn, connection_properties, lifetime, tx, options)
     }
   }
 }
@@ -1045,6 +1074,11 @@ where
 
   let lifetime = resource.lifetime();
 
+  let options = {
+    let state = state.borrow();
+    *state.borrow::<Options>()
+  };
+
   let listen_properties_clone: HttpListenProperties = listen_properties.clone();
   let handle = spawn(async move {
     loop {
@@ -1057,6 +1091,7 @@ where
         &listen_properties_clone,
         lifetime.clone(),
         tx.clone(),
+        options,
       );
     }
     #[allow(unreachable_code)]
@@ -1093,11 +1128,17 @@ where
   let (tx, rx) = tokio::sync::mpsc::channel(10);
   let resource: Rc<HttpJoinHandle> = Rc::new(HttpJoinHandle::new(rx));
 
+  let options = {
+    let state = state.borrow();
+    *state.borrow::<Options>()
+  };
+
   let handle = serve_http_on::<HTTP>(
     connection,
     &listen_properties,
     resource.lifetime(),
     tx,
+    options,
   );
 
   // Set the handle after we start the future
