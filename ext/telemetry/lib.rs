@@ -18,10 +18,6 @@ use std::thread;
 use std::time::Duration;
 use std::time::SystemTime;
 
-use deno_core::anyhow;
-use deno_core::anyhow::anyhow;
-use deno_core::error::type_error;
-use deno_core::error::AnyError;
 use deno_core::futures::channel::mpsc;
 use deno_core::futures::channel::mpsc::UnboundedSender;
 use deno_core::futures::future::BoxFuture;
@@ -31,8 +27,11 @@ use deno_core::futures::Stream;
 use deno_core::futures::StreamExt;
 use deno_core::op2;
 use deno_core::v8;
+use deno_core::v8::DataError;
 use deno_core::GarbageCollected;
 use deno_core::OpState;
+use deno_error::JsError;
+use deno_error::JsErrorBox;
 use once_cell::sync::Lazy;
 use once_cell::sync::OnceCell;
 use opentelemetry::logs::AnyValue;
@@ -43,6 +42,7 @@ use opentelemetry::metrics::InstrumentBuilder;
 use opentelemetry::metrics::MeterProvider as _;
 use opentelemetry::otel_debug;
 use opentelemetry::otel_error;
+use opentelemetry::trace::Link;
 use opentelemetry::trace::SpanContext;
 use opentelemetry::trace::SpanId;
 use opentelemetry::trace::SpanKind;
@@ -83,6 +83,7 @@ use opentelemetry_semantic_conventions::resource::TELEMETRY_SDK_NAME;
 use opentelemetry_semantic_conventions::resource::TELEMETRY_SDK_VERSION;
 use serde::Deserialize;
 use serde::Serialize;
+use thiserror::Error;
 use tokio::sync::oneshot;
 use tokio::task::JoinSet;
 
@@ -94,6 +95,7 @@ deno_core::extension!(
     op_otel_span_attribute1,
     op_otel_span_attribute2,
     op_otel_span_attribute3,
+    op_otel_span_add_link,
     op_otel_span_update_name,
     op_otel_metric_attribute3,
     op_otel_metric_record0,
@@ -475,10 +477,17 @@ mod hyper_client {
   use std::task::Poll;
   use std::task::{self};
 
+  use deno_tls::create_client_config;
+  use deno_tls::load_certs;
+  use deno_tls::load_private_keys;
+  use deno_tls::SocketUse;
+  use deno_tls::TlsKey;
+  use deno_tls::TlsKeys;
   use http_body_util::BodyExt;
   use http_body_util::Full;
   use hyper::body::Body as HttpBody;
   use hyper::body::Frame;
+  use hyper_rustls::HttpsConnector;
   use hyper_util::client::legacy::connect::HttpConnector;
   use hyper_util::client::legacy::Client;
   use opentelemetry_http::Bytes;
@@ -492,14 +501,41 @@ mod hyper_client {
   // same as opentelemetry_http::HyperClient except it uses OtelSharedRuntime
   #[derive(Debug, Clone)]
   pub struct HyperClient {
-    inner: Client<HttpConnector, Body>,
+    inner: Client<HttpsConnector<HttpConnector>, Body>,
   }
 
   impl HyperClient {
-    pub fn new() -> Self {
-      Self {
-        inner: Client::builder(OtelSharedRuntime).build(HttpConnector::new()),
-      }
+    pub fn new() -> deno_core::anyhow::Result<Self> {
+      let ca_certs = match std::env::var("OTEL_EXPORTER_OTLP_CERTIFICATE") {
+        Ok(path) => vec![std::fs::read(path)?],
+        _ => vec![],
+      };
+
+      let keys = match (
+        std::env::var("OTEL_EXPORTER_OTLP_CLIENT_KEY"),
+        std::env::var("OTEL_EXPORTER_OTLP_CLIENT_CERTIFICATE"),
+      ) {
+        (Ok(key_path), Ok(cert_path)) => {
+          let key = std::fs::read(key_path)?;
+          let cert = std::fs::read(cert_path)?;
+
+          let certs = load_certs(&mut std::io::Cursor::new(cert))?;
+          let key = load_private_keys(&key)?.into_iter().next().unwrap();
+
+          TlsKeys::Static(TlsKey(certs, key))
+        }
+        _ => TlsKeys::Null,
+      };
+
+      let tls_config =
+        create_client_config(None, ca_certs, None, keys, SocketUse::Http)?;
+      let mut http_connector = HttpConnector::new();
+      http_connector.enforce_http(false);
+      let connector = HttpsConnector::from((http_connector, tls_config));
+
+      Ok(Self {
+        inner: Client::builder(OtelSharedRuntime).build(connector),
+      })
     }
   }
 
@@ -563,7 +599,7 @@ static OTEL_GLOBALS: OnceCell<OtelGlobals> = OnceCell::new();
 pub fn init(
   rt_config: OtelRuntimeConfig,
   config: &OtelConfig,
-) -> anyhow::Result<()> {
+) -> deno_core::anyhow::Result<()> {
   // Parse the `OTEL_EXPORTER_OTLP_PROTOCOL` variable. The opentelemetry_*
   // crates don't do this automatically.
   // TODO(piscisaureus): enable GRPC support.
@@ -572,13 +608,13 @@ pub fn init(
     Ok("http/json") => Protocol::HttpJson,
     Ok("") | Err(env::VarError::NotPresent) => Protocol::HttpBinary,
     Ok(protocol) => {
-      return Err(anyhow!(
+      return Err(deno_core::anyhow::anyhow!(
         "Env var OTEL_EXPORTER_OTLP_PROTOCOL specifies an unsupported protocol: {}",
         protocol
       ));
     }
     Err(err) => {
-      return Err(anyhow!(
+      return Err(deno_core::anyhow::anyhow!(
         "Failed to read env var OTEL_EXPORTER_OTLP_PROTOCOL: {}",
         err
       ));
@@ -626,7 +662,7 @@ pub fn init(
   // `OTEL_EXPORTER_OTLP_ENDPOINT` environment variable. Additional headers can
   // be specified using `OTEL_EXPORTER_OTLP_HEADERS`.
 
-  let client = hyper_client::HyperClient::new();
+  let client = hyper_client::HyperClient::new()?;
 
   let span_exporter = HttpExporterBuilder::default()
     .with_http_client(client.clone())
@@ -645,7 +681,7 @@ pub fn init(
     Some("delta") => Temporality::Delta,
     Some("lowmemory") => Temporality::LowMemory,
     Some(other) => {
-      return Err(anyhow!(
+      return Err(deno_core::anyhow::anyhow!(
         "Invalid value for OTEL_EXPORTER_OTLP_METRICS_TEMPORALITY_PREFERENCE: {}",
         other
       ));
@@ -688,7 +724,7 @@ pub fn init(
       meter_provider,
       builtin_instrumentation_scope,
     })
-    .map_err(|_| anyhow!("failed to set otel globals"))?;
+    .map_err(|_| deno_core::anyhow::anyhow!("failed to set otel globals"))?;
 
   Ok(())
 }
@@ -1100,7 +1136,7 @@ impl OtelTracer {
     #[smi] span_kind: u8,
     start_time: Option<f64>,
     #[smi] attribute_count: usize,
-  ) -> Result<OtelSpan, anyhow::Error> {
+  ) -> Result<OtelSpan, JsErrorBox> {
     let OtelGlobals { id_generator, .. } = OTEL_GLOBALS.get().unwrap();
     let span_context;
     let parent_span_id;
@@ -1131,20 +1167,25 @@ impl OtelTracer {
         parent_span_id = SpanId::INVALID;
       }
     }
-    let name = owned_string(scope, name.try_cast()?);
+    let name = owned_string(
+      scope,
+      name
+        .try_cast()
+        .map_err(|e: DataError| JsErrorBox::generic(e.to_string()))?,
+    );
     let span_kind = match span_kind {
       0 => SpanKind::Internal,
       1 => SpanKind::Server,
       2 => SpanKind::Client,
       3 => SpanKind::Producer,
       4 => SpanKind::Consumer,
-      _ => return Err(anyhow!("invalid span kind")),
+      _ => return Err(JsErrorBox::generic("invalid span kind")),
     };
     let start_time = start_time
       .map(|start_time| {
         SystemTime::UNIX_EPOCH
           .checked_add(std::time::Duration::from_secs_f64(start_time))
-          .ok_or_else(|| anyhow!("invalid start time"))
+          .ok_or_else(|| JsErrorBox::generic("invalid start time"))
       })
       .unwrap_or_else(|| Ok(SystemTime::now()))?;
     let span_data = SpanData {
@@ -1176,14 +1217,14 @@ impl OtelTracer {
     #[smi] span_kind: u8,
     start_time: Option<f64>,
     #[smi] attribute_count: usize,
-  ) -> Result<OtelSpan, anyhow::Error> {
+  ) -> Result<OtelSpan, JsErrorBox> {
     let parent_trace_id = parse_trace_id(scope, parent_trace_id);
     if parent_trace_id == TraceId::INVALID {
-      return Err(anyhow!("invalid trace id"));
+      return Err(JsErrorBox::generic("invalid trace id"));
     };
     let parent_span_id = parse_span_id(scope, parent_span_id);
     if parent_span_id == SpanId::INVALID {
-      return Err(anyhow!("invalid span id"));
+      return Err(JsErrorBox::generic("invalid span id"));
     };
     let OtelGlobals { id_generator, .. } = OTEL_GLOBALS.get().unwrap();
     let span_context = SpanContext::new(
@@ -1193,20 +1234,25 @@ impl OtelTracer {
       false,
       TraceState::NONE,
     );
-    let name = owned_string(scope, name.try_cast()?);
+    let name = owned_string(
+      scope,
+      name
+        .try_cast()
+        .map_err(|e: DataError| JsErrorBox::generic(e.to_string()))?,
+    );
     let span_kind = match span_kind {
       0 => SpanKind::Internal,
       1 => SpanKind::Server,
       2 => SpanKind::Client,
       3 => SpanKind::Producer,
       4 => SpanKind::Consumer,
-      _ => return Err(anyhow!("invalid span kind")),
+      _ => return Err(JsErrorBox::generic("invalid span kind")),
     };
     let start_time = start_time
       .map(|start_time| {
         SystemTime::UNIX_EPOCH
           .checked_add(std::time::Duration::from_secs_f64(start_time))
-          .ok_or_else(|| anyhow!("invalid start time"))
+          .ok_or_else(|| JsErrorBox::generic("invalid start time"))
       })
       .unwrap_or_else(|| Ok(SystemTime::now()))?;
     let span_data = SpanData {
@@ -1237,6 +1283,16 @@ struct JsSpanContext {
   trace_flags: u8,
 }
 
+#[derive(Debug, Error, JsError)]
+#[error("OtelSpan cannot be constructed.")]
+#[class(type)]
+struct OtelSpanCannotBeConstructedError;
+
+#[derive(Debug, Error, JsError)]
+#[error("invalid span status code")]
+#[class(type)]
+struct InvalidSpanStatusCodeError;
+
 // boxed because of https://github.com/denoland/rusty_v8/issues/1676
 #[derive(Debug)]
 struct OtelSpan(RefCell<Box<OtelSpanState>>);
@@ -1254,8 +1310,8 @@ impl deno_core::GarbageCollected for OtelSpan {}
 impl OtelSpan {
   #[constructor]
   #[cppgc]
-  fn new() -> Result<OtelSpan, AnyError> {
-    Err(type_error("OtelSpan can not be constructed."))
+  fn new() -> Result<OtelSpan, OtelSpanCannotBeConstructedError> {
+    Err(OtelSpanCannotBeConstructedError)
   }
 
   #[serde]
@@ -1277,7 +1333,7 @@ impl OtelSpan {
     &self,
     #[smi] status: u8,
     #[string] error_description: String,
-  ) -> Result<(), AnyError> {
+  ) -> Result<(), InvalidSpanStatusCodeError> {
     let mut state = self.0.borrow_mut();
     let OtelSpanState::Recording(span) = &mut **state else {
       return Ok(());
@@ -1288,7 +1344,7 @@ impl OtelSpan {
       2 => SpanStatus::Error {
         description: Cow::Owned(error_description),
       },
-      _ => return Err(type_error("invalid span status code")),
+      _ => return Err(InvalidSpanStatusCodeError),
     };
     Ok(())
   }
@@ -1299,17 +1355,6 @@ impl OtelSpan {
     match &mut **state {
       OtelSpanState::Recording(span) => {
         span.events.dropped_count += 1;
-      }
-      OtelSpanState::Done(_) => {}
-    }
-  }
-
-  #[fast]
-  fn drop_link(&self) {
-    let mut state = self.0.borrow_mut();
-    match &mut **state {
-      OtelSpanState::Recording(span) => {
-        span.links.dropped_count += 1;
       }
       OtelSpanState::Done(_) => {}
     }
@@ -1428,6 +1473,48 @@ fn op_otel_span_update_name<'s>(
   }
 }
 
+#[op2(fast)]
+fn op_otel_span_add_link<'s>(
+  scope: &mut v8::HandleScope<'s>,
+  span: v8::Local<'s, v8::Value>,
+  trace_id: v8::Local<'s, v8::Value>,
+  span_id: v8::Local<'s, v8::Value>,
+  #[smi] trace_flags: u8,
+  is_remote: bool,
+  #[smi] dropped_attributes_count: u32,
+) -> bool {
+  let trace_id = parse_trace_id(scope, trace_id);
+  if trace_id == TraceId::INVALID {
+    return false;
+  };
+  let span_id = parse_span_id(scope, span_id);
+  if span_id == SpanId::INVALID {
+    return false;
+  };
+  let span_context = SpanContext::new(
+    trace_id,
+    span_id,
+    TraceFlags::new(trace_flags),
+    is_remote,
+    TraceState::NONE,
+  );
+
+  let Some(span) =
+    deno_core::_ops::try_unwrap_cppgc_object::<OtelSpan>(scope, span)
+  else {
+    return true;
+  };
+  let mut state = span.0.borrow_mut();
+  if let OtelSpanState::Recording(span) = &mut **state {
+    span.links.links.push(Link::new(
+      span_context,
+      vec![],
+      dropped_attributes_count,
+    ));
+  }
+  true
+}
+
 struct OtelMeter(opentelemetry::metrics::Meter);
 
 impl deno_core::GarbageCollected for OtelMeter {}
@@ -1464,7 +1551,7 @@ impl OtelMeter {
     name: v8::Local<'s, v8::Value>,
     description: v8::Local<'s, v8::Value>,
     unit: v8::Local<'s, v8::Value>,
-  ) -> Result<Instrument, anyhow::Error> {
+  ) -> Result<Instrument, JsErrorBox> {
     create_instrument(
       |name| self.0.f64_counter(name),
       |i| Instrument::Counter(i.build()),
@@ -1473,6 +1560,7 @@ impl OtelMeter {
       description,
       unit,
     )
+    .map_err(|e| JsErrorBox::generic(e.to_string()))
   }
 
   #[cppgc]
@@ -1482,7 +1570,7 @@ impl OtelMeter {
     name: v8::Local<'s, v8::Value>,
     description: v8::Local<'s, v8::Value>,
     unit: v8::Local<'s, v8::Value>,
-  ) -> Result<Instrument, anyhow::Error> {
+  ) -> Result<Instrument, JsErrorBox> {
     create_instrument(
       |name| self.0.f64_up_down_counter(name),
       |i| Instrument::UpDownCounter(i.build()),
@@ -1491,6 +1579,7 @@ impl OtelMeter {
       description,
       unit,
     )
+    .map_err(|e| JsErrorBox::generic(e.to_string()))
   }
 
   #[cppgc]
@@ -1500,7 +1589,7 @@ impl OtelMeter {
     name: v8::Local<'s, v8::Value>,
     description: v8::Local<'s, v8::Value>,
     unit: v8::Local<'s, v8::Value>,
-  ) -> Result<Instrument, anyhow::Error> {
+  ) -> Result<Instrument, JsErrorBox> {
     create_instrument(
       |name| self.0.f64_gauge(name),
       |i| Instrument::Gauge(i.build()),
@@ -1509,6 +1598,7 @@ impl OtelMeter {
       description,
       unit,
     )
+    .map_err(|e| JsErrorBox::generic(e.to_string()))
   }
 
   #[cppgc]
@@ -1519,15 +1609,30 @@ impl OtelMeter {
     description: v8::Local<'s, v8::Value>,
     unit: v8::Local<'s, v8::Value>,
     #[serde] boundaries: Option<Vec<f64>>,
-  ) -> Result<Instrument, anyhow::Error> {
-    let name = owned_string(scope, name.try_cast()?);
+  ) -> Result<Instrument, JsErrorBox> {
+    let name = owned_string(
+      scope,
+      name
+        .try_cast()
+        .map_err(|e: DataError| JsErrorBox::generic(e.to_string()))?,
+    );
     let mut builder = self.0.f64_histogram(name);
     if !description.is_null_or_undefined() {
-      let description = owned_string(scope, description.try_cast()?);
+      let description = owned_string(
+        scope,
+        description
+          .try_cast()
+          .map_err(|e: DataError| JsErrorBox::generic(e.to_string()))?,
+      );
       builder = builder.with_description(description);
     };
     if !unit.is_null_or_undefined() {
-      let unit = owned_string(scope, unit.try_cast()?);
+      let unit = owned_string(
+        scope,
+        unit
+          .try_cast()
+          .map_err(|e: DataError| JsErrorBox::generic(e.to_string()))?,
+      );
       builder = builder.with_unit(unit);
     };
     if let Some(boundaries) = boundaries {
@@ -1544,7 +1649,7 @@ impl OtelMeter {
     name: v8::Local<'s, v8::Value>,
     description: v8::Local<'s, v8::Value>,
     unit: v8::Local<'s, v8::Value>,
-  ) -> Result<Instrument, anyhow::Error> {
+  ) -> Result<Instrument, JsErrorBox> {
     create_async_instrument(
       |name| self.0.f64_observable_counter(name),
       |i| {
@@ -1555,6 +1660,7 @@ impl OtelMeter {
       description,
       unit,
     )
+    .map_err(|e| JsErrorBox::generic(e.to_string()))
   }
 
   #[cppgc]
@@ -1564,7 +1670,7 @@ impl OtelMeter {
     name: v8::Local<'s, v8::Value>,
     description: v8::Local<'s, v8::Value>,
     unit: v8::Local<'s, v8::Value>,
-  ) -> Result<Instrument, anyhow::Error> {
+  ) -> Result<Instrument, JsErrorBox> {
     create_async_instrument(
       |name| self.0.f64_observable_up_down_counter(name),
       |i| {
@@ -1575,6 +1681,7 @@ impl OtelMeter {
       description,
       unit,
     )
+    .map_err(|e| JsErrorBox::generic(e.to_string()))
   }
 
   #[cppgc]
@@ -1584,7 +1691,7 @@ impl OtelMeter {
     name: v8::Local<'s, v8::Value>,
     description: v8::Local<'s, v8::Value>,
     unit: v8::Local<'s, v8::Value>,
-  ) -> Result<Instrument, anyhow::Error> {
+  ) -> Result<Instrument, JsErrorBox> {
     create_async_instrument(
       |name| self.0.f64_observable_gauge(name),
       |i| {
@@ -1595,6 +1702,7 @@ impl OtelMeter {
       description,
       unit,
     )
+    .map_err(|e| JsErrorBox::generic(e.to_string()))
   }
 }
 
@@ -1615,7 +1723,7 @@ fn create_instrument<'a, 'b, T>(
   name: v8::Local<'a, v8::Value>,
   description: v8::Local<'a, v8::Value>,
   unit: v8::Local<'a, v8::Value>,
-) -> Result<Instrument, anyhow::Error> {
+) -> Result<Instrument, v8::DataError> {
   let name = owned_string(scope, name.try_cast()?);
   let mut builder = cb(name);
   if !description.is_null_or_undefined() {
@@ -1637,7 +1745,7 @@ fn create_async_instrument<'a, 'b, T>(
   name: v8::Local<'a, v8::Value>,
   description: v8::Local<'a, v8::Value>,
   unit: v8::Local<'a, v8::Value>,
-) -> Result<Instrument, anyhow::Error> {
+) -> Result<Instrument, DataError> {
   let name = owned_string(scope, name.try_cast()?);
   let mut builder = cb(name);
   if !description.is_null_or_undefined() {

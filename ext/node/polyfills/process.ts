@@ -58,7 +58,7 @@ import {
 } from "ext:deno_node/_next_tick.ts";
 import { isWindows } from "ext:deno_node/_util/os.ts";
 import * as io from "ext:deno_io/12_io.js";
-import * as denoOs from "ext:runtime/30_os.js";
+import * as denoOs from "ext:deno_os/30_os.js";
 
 export let argv0 = "";
 
@@ -441,11 +441,7 @@ Process.prototype.config = {
 };
 
 Process.prototype.cpuUsage = function () {
-  warnNotImplemented("process.cpuUsage()");
-  return {
-    user: 0,
-    system: 0,
-  };
+  return Deno.cpuUsage();
 };
 
 /** https://nodejs.org/api/process.html#process_process_cwd */
@@ -784,6 +780,7 @@ const process = new Process();
 
 /* Set owned property */
 process.versions = versions;
+process.env = env;
 
 Object.defineProperty(process, Symbol.toStringTag, {
   enumerable: false,
