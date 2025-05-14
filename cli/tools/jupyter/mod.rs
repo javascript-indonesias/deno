@@ -22,6 +22,7 @@ use jupyter_runtime::messaging::StreamContent;
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::UnboundedSender;
 use tokio::sync::oneshot;
+use tokio_util::sync::CancellationToken;
 
 use crate::args::Flags;
 use crate::args::JupyterFlags;
@@ -48,18 +49,24 @@ pub async fn kernel(
   );
 
   if !jupyter_flags.install && !jupyter_flags.kernel {
-    install::status()?;
+    install::status(jupyter_flags.name.as_deref())?;
     return Ok(());
   }
 
   if jupyter_flags.install {
-    install::install()?;
+    install::install(
+      jupyter_flags.name.as_deref(),
+      jupyter_flags.display.as_deref(),
+      jupyter_flags.force,
+    )?;
     return Ok(());
   }
 
   let connection_filepath = jupyter_flags.conn_file.unwrap();
 
   let factory = CliFactory::from_flags(flags);
+  let registry_provider =
+    Arc::new(factory.lockfile_npm_package_info_provider()?);
   let cli_options = factory.cli_options()?;
   let main_module =
     resolve_url_or_path("./$deno$jupyter.mts", cli_options.initial_cwd())
@@ -67,7 +74,7 @@ pub async fn kernel(
   // TODO(bartlomieju): should we run with all permissions?
   let permissions =
     PermissionsContainer::allow_all(factory.permission_desc_parser()?.clone());
-  let npm_installer = factory.npm_installer_if_managed()?.cloned();
+  let npm_installer = factory.npm_installer_if_managed().await?.cloned();
   let tsconfig_resolver = factory.tsconfig_resolver()?;
   let resolver = factory.resolver().await?.clone();
   let worker_factory = factory.create_cli_main_worker_factory().await?;
@@ -97,8 +104,8 @@ pub async fn kernel(
       main_module.clone(),
       permissions,
       vec![
-        ops::jupyter::deno_jupyter::init_ops(stdio_tx.clone()),
-        ops::testing::deno_test::init_ops(test_event_sender),
+        ops::jupyter::deno_jupyter::init(stdio_tx.clone()),
+        ops::testing::deno_test::init(test_event_sender),
       ],
       // FIXME(nayeemrmn): Test output capturing currently doesn't work.
       Stdio {
@@ -106,6 +113,7 @@ pub async fn kernel(
         stdout: StdioPipe::file(stdout),
         stderr: StdioPipe::file(stderr),
       },
+      None,
     )
     .await?;
   worker.setup_repl().await?;
@@ -122,6 +130,7 @@ pub async fn kernel(
     worker,
     main_module,
     test_event_receiver,
+    registry_provider,
   )
   .await?;
   struct TestWriter(UnboundedSender<StreamContent>);
@@ -390,7 +399,9 @@ impl JupyterReplSession {
         line_text,
         position,
       } => JupyterReplResponse::LspCompletions(
-        self.lsp_completions(&line_text, position).await,
+        self
+          .lsp_completions(&line_text, position, CancellationToken::new())
+          .await,
       ),
       JupyterReplRequest::JsGetProperties { object_id } => {
         JupyterReplResponse::JsGetProperties(
@@ -432,11 +443,12 @@ impl JupyterReplSession {
     &mut self,
     line_text: &str,
     position: usize,
+    token: CancellationToken,
   ) -> Vec<ReplCompletionItem> {
     self
       .repl_session
       .language_server
-      .completions(line_text, position)
+      .completions(line_text, position, token)
       .await
   }
 
