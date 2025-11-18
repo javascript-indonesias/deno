@@ -3,8 +3,8 @@
 use std::cell::RefCell;
 use std::thread;
 
-use deno_core::v8;
 use deno_core::ModuleSpecifier;
+use deno_core::v8;
 use deno_telemetry::OtelConfig;
 use deno_terminal::colors;
 use serde::Serialize;
@@ -36,6 +36,8 @@ pub enum WorkerExecutionMode {
   },
   /// `deno jupyter`
   Jupyter,
+  /// `deno deploy`
+  Deploy,
 }
 
 impl WorkerExecutionMode {
@@ -51,6 +53,7 @@ impl WorkerExecutionMode {
       WorkerExecutionMode::ServeMain { .. }
       | WorkerExecutionMode::ServeWorker { .. } => 7,
       WorkerExecutionMode::Jupyter => 8,
+      WorkerExecutionMode::Deploy => 9,
     }
   }
 }
@@ -112,6 +115,7 @@ pub struct BootstrapOptions {
   // Used by `deno serve`
   pub serve_port: Option<u16>,
   pub serve_host: Option<String>,
+  pub auto_serve: bool,
   pub otel_config: OtelConfig,
   pub close_on_idle: bool,
 }
@@ -141,6 +145,7 @@ impl Default for BootstrapOptions {
       inspect: false,
       args: Default::default(),
       is_standalone: false,
+      auto_serve: false,
       has_node_modules_dir: false,
       argv0: None,
       node_debug: None,
@@ -198,13 +203,15 @@ struct BootstrapV8<'a>(
   bool,
   // is_standalone
   bool,
+  // auto serve
+  bool,
 );
 
 impl BootstrapOptions {
   /// Return the v8 equivalent of this structure.
   pub fn as_v8<'s>(
     &self,
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
   ) -> v8::Local<'s, v8::Value> {
     let scope = RefCell::new(scope);
     let ser = deno_core::serde_v8::Serializer::new(&scope);
@@ -230,6 +237,7 @@ impl BootstrapOptions {
       self.otel_config.as_v8(),
       self.close_on_idle,
       self.is_standalone,
+      self.auto_serve,
     );
 
     bootstrap.serialize(ser).unwrap()

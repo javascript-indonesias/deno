@@ -163,6 +163,9 @@ function exec({ config, debug: debugFlag, rootNames, localOnly }) {
       : ts.sortAndDeduplicateDiagnostics(
         checkFiles.map((s) => program.getSemanticDiagnostics(s)).flat(),
       )),
+    ...(options.isolatedDeclarations
+      ? program.getDeclarationDiagnostics()
+      : []),
   ].filter(filterMapDiagnostic);
 
   // emit the tsbuildinfo file
@@ -171,8 +174,10 @@ function exec({ config, debug: debugFlag, rootNames, localOnly }) {
 
   performanceProgram({ program });
 
+  const checker = program.getProgram().getTypeChecker();
   ops.op_respond({
     diagnostics: fromTypeScriptDiagnostics(diagnostics),
+    ambientModules: checker.getAmbientModules().map((symbol) => symbol.name),
     stats: performanceEnd(),
   });
   debug("<<< exec stop");

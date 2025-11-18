@@ -10,22 +10,34 @@ use std::ffi::c_void;
 ))]
 use std::ptr::NonNull;
 
-use deno_core::cppgc::SameObject;
+use deno_core::FromV8;
+use deno_core::GarbageCollected;
+use deno_core::OpState;
 use deno_core::op2;
 use deno_core::v8;
 use deno_core::v8::Local;
 use deno_core::v8::Value;
-use deno_core::FromV8;
-use deno_core::GarbageCollected;
-use deno_core::OpState;
 use deno_error::JsErrorBox;
 
+use crate::SameObject;
 use crate::surface::GPUCanvasContext;
 
 #[derive(Debug, thiserror::Error, deno_error::JsError)]
 pub enum ByowError {
+  #[cfg(not(any(
+    target_os = "macos",
+    target_os = "windows",
+    target_os = "linux",
+    target_os = "freebsd",
+    target_os = "openbsd",
+  )))]
   #[class(type)]
-  #[error("Cannot create surface outside of WebGPU context. Did you forget to call `navigator.gpu.requestAdapter()`?")]
+  #[error("Unsupported platform")]
+  Unsupported,
+  #[class(type)]
+  #[error(
+    "Cannot create surface outside of WebGPU context. Did you forget to call `navigator.gpu.requestAdapter()`?"
+  )]
   WebGPUNotInitiated,
   #[class(type)]
   #[error("Invalid parameters")]
@@ -81,7 +93,10 @@ pub struct UnsafeWindowSurface {
   pub context: SameObject<GPUCanvasContext>,
 }
 
-impl GarbageCollected for UnsafeWindowSurface {
+// SAFETY: we're sure this can be GCed
+unsafe impl GarbageCollected for UnsafeWindowSurface {
+  fn trace(&self, _visitor: &mut deno_core::v8::cppgc::Visitor) {}
+
   fn get_name(&self) -> &'static std::ffi::CStr {
     c"UnsafeWindowSurface"
   }
@@ -141,25 +156,40 @@ impl UnsafeWindowSurface {
   fn get_context(
     &self,
     #[this] this: v8::Global<v8::Object>,
-    scope: &mut v8::HandleScope,
+    scope: &mut v8::PinScope<'_, '_>,
   ) -> v8::Global<v8::Object> {
     self.context.get(scope, |_| GPUCanvasContext {
       surface_id: self.id,
       width: self.width.clone(),
       height: self.height.clone(),
       config: RefCell::new(None),
-      texture: RefCell::new(None),
+      texture: RefCell::new(v8::TracedReference::empty()),
       canvas: this,
     })
   }
 
   #[nofast]
-  fn present(&self, scope: &mut v8::HandleScope) -> Result<(), JsErrorBox> {
+  fn present(
+    &self,
+    scope: &mut v8::PinScope<'_, '_>,
+  ) -> Result<(), JsErrorBox> {
     let Some(context) = self.context.try_unwrap(scope) else {
       return Err(JsErrorBox::type_error("getContext was never called"));
     };
 
-    context.present().map_err(JsErrorBox::from_err)
+    context.present(scope).map_err(JsErrorBox::from_err)
+  }
+
+  #[fast]
+  fn resize(&self, width: u32, height: u32, scope: &mut v8::PinScope<'_, '_>) {
+    self.width.replace(width);
+    self.height.replace(height);
+
+    let Some(context) = self.context.try_unwrap(scope) else {
+      return;
+    };
+
+    context.resize_configure(width, height);
   }
 }
 
@@ -183,7 +213,7 @@ impl<'a> FromV8<'a> for UnsafeWindowSurfaceOptions {
   type Error = JsErrorBox;
 
   fn from_v8(
-    scope: &mut v8::HandleScope<'a>,
+    scope: &mut v8::PinScope<'a, '_>,
     value: Local<'a, Value>,
   ) -> Result<Self, Self::Error> {
     let obj = value
@@ -203,7 +233,7 @@ impl<'a> FromV8<'a> for UnsafeWindowSurfaceOptions {
       _ => {
         return Err(JsErrorBox::type_error(format!(
           "Invalid system kind '{s}'"
-        )))
+        )));
       }
     };
 
@@ -227,13 +257,17 @@ impl<'a> FromV8<'a> for UnsafeWindowSurfaceOptions {
     let val = obj
       .get(scope, key.into())
       .ok_or_else(|| JsErrorBox::type_error("missing field 'width'"))?;
-    let width = deno_core::convert::Number::<u32>::from_v8(scope, val)?.0;
+    let width = deno_core::convert::Number::<u32>::from_v8(scope, val)
+      .map_err(JsErrorBox::from_err)?
+      .0;
 
     let key = v8::String::new(scope, "height").unwrap();
     let val = obj
       .get(scope, key.into())
       .ok_or_else(|| JsErrorBox::type_error("missing field 'height'"))?;
-    let height = deno_core::convert::Number::<u32>::from_v8(scope, val)?.0;
+    let height = deno_core::convert::Number::<u32>::from_v8(scope, val)
+      .map_err(JsErrorBox::from_err)?
+      .0;
 
     Ok(Self {
       system,
@@ -346,6 +380,6 @@ fn raw_window(
   _system: UnsafeWindowSurfaceSystem,
   _window: *const c_void,
   _display: *const c_void,
-) -> Result<RawHandles, deno_error::JsErrorBox> {
-  Err(deno_error::JsErrorBox::type_error("Unsupported platform"))
+) -> Result<RawHandles, ByowError> {
+  Err(ByowError::Unsupported)
 }

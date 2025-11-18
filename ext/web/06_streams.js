@@ -99,7 +99,7 @@ import {
   signalAbort,
 } from "./03_abort_signal.js";
 
-import { createFilteredInspectProxy } from "ext:deno_console/01_console.js";
+import { createFilteredInspectProxy } from "./01_console.js";
 import { assert, AssertionError } from "./00_infra.js";
 
 /** @template T */
@@ -787,8 +787,7 @@ class ResourceStreamResourceSink {
 async function readableStreamWriteChunkFn(reader, sink, chunk) {
   // Empty chunk. Re-read.
   if (chunk.length == 0) {
-    await readableStreamReadFn(reader, sink);
-    return;
+    return true;
   }
 
   const res = op_readable_stream_resource_write_sync(sink.external, chunk);
@@ -796,9 +795,10 @@ async function readableStreamWriteChunkFn(reader, sink, chunk) {
     // Closed
     await reader.cancel("resource closed");
     sink.close();
+
+    return false;
   } else if (res == 1) {
-    // Successfully written (synchronous). Re-read.
-    await readableStreamReadFn(reader, sink);
+    return true;
   } else if (res == 2) {
     // Full. If the channel is full, we perform an async await until we can write, and then return
     // to a synchronous loop.
@@ -808,10 +808,12 @@ async function readableStreamWriteChunkFn(reader, sink, chunk) {
         chunk,
       )
     ) {
-      await readableStreamReadFn(reader, sink);
+      return true;
     } else {
       await reader.cancel("resource closed");
       sink.close();
+
+      return false;
     }
   }
 }
@@ -820,60 +822,66 @@ async function readableStreamWriteChunkFn(reader, sink, chunk) {
  * @param {ReadableStreamDefaultReader<Uint8Array>} reader
  * @param {any} sink
  */
-function readableStreamReadFn(reader, sink) {
-  // The ops here look like op_write_all/op_close, but we're not actually writing to a
-  // real resource.
-  let reentrant = true;
-  let gotChunk = undefined;
-  const promise = new Deferred();
-  readableStreamDefaultReaderRead(reader, {
-    chunkSteps(chunk) {
-      // If the chunk has non-zero length, write it
-      if (reentrant) {
-        gotChunk = chunk;
-      } else {
-        PromisePrototypeThen(
-          readableStreamWriteChunkFn(reader, sink, chunk),
-          () => promise.resolve(),
-          (e) => promise.reject(e),
-        );
-      }
-    },
-    closeSteps() {
-      sink.close();
-      promise.resolve();
-    },
-    errorSteps(error) {
-      const success = op_readable_stream_resource_write_error(
-        sink.external,
-        extractStringErrorFromError(error),
-      );
-      // We don't cancel the reader if there was an error reading. We'll let the downstream
-      // consumer close the resource after it receives the error.
-      if (!success) {
-        PromisePrototypeThen(
-          reader.cancel("resource closed"),
-          () => {
-            sink.close();
-            promise.resolve();
-          },
-          (e) => promise.reject(e),
-        );
-      } else {
+async function readableStreamReadFn(reader, sink) {
+  let loop = true;
+
+  while (loop) {
+    // The ops here look like op_write_all/op_close, but we're not actually writing to a
+    // real resource.
+    let reentrant = true;
+    let gotChunk = undefined;
+    const promise = new Deferred();
+
+    readableStreamDefaultReaderRead(reader, {
+      chunkSteps(chunk) {
+        // If the chunk has non-zero length, write it
+        if (reentrant) {
+          gotChunk = chunk;
+        } else {
+          PromisePrototypeThen(
+            readableStreamWriteChunkFn(reader, sink, chunk),
+            (loop) => promise.resolve(loop),
+            (e) => promise.reject(e),
+          );
+        }
+      },
+      closeSteps() {
         sink.close();
-        promise.resolve();
-      }
-    },
-  });
-  reentrant = false;
-  if (gotChunk) {
-    PromisePrototypeThen(
-      readableStreamWriteChunkFn(reader, sink, gotChunk),
-      () => promise.resolve(),
-      (e) => promise.reject(e),
-    );
+        promise.resolve(false);
+      },
+      errorSteps(error) {
+        const success = op_readable_stream_resource_write_error(
+          sink.external,
+          extractStringErrorFromError(error),
+        );
+        // We don't cancel the reader if there was an error reading. We'll let the downstream
+        // consumer close the resource after it receives the error.
+        if (!success) {
+          PromisePrototypeThen(
+            reader.cancel("resource closed"),
+            () => {
+              sink.close();
+              promise.resolve(false);
+            },
+            (e) => promise.reject(e),
+          );
+        } else {
+          sink.close();
+          promise.resolve(false);
+        }
+      },
+    });
+    reentrant = false;
+    if (gotChunk) {
+      PromisePrototypeThen(
+        readableStreamWriteChunkFn(reader, sink, gotChunk),
+        (loop) => promise.resolve(loop),
+        (e) => promise.reject(e),
+      );
+    }
+
+    loop = await promise.promise;
   }
-  return promise.promise;
 }
 
 /**
@@ -926,10 +934,9 @@ const RESOURCE_REGISTRY = new SafeFinalizationRegistry((rid) => {
 const _readAll = Symbol("[[readAll]]");
 const _original = Symbol("[[original]]");
 /**
- * Create a new ReadableStream object that is backed by a Resource that
- * implements `Resource::read_return`. This object contains enough metadata to
- * allow callers to bypass the JavaScript ReadableStream implementation and
- * read directly from the underlying resource if they so choose (FastStream).
+ * Create a new ReadableStream object that is backed by a resource that
+ * implements reading operations. This object contains enough metadata to
+ * allow callers to access the underlying resource if needed.
  *
  * @param {number} rid The resource ID to read from.
  * @param {boolean=} autoClose If the resource should be auto-closed when the stream closes. Defaults to true.
@@ -1000,17 +1007,18 @@ function readableStreamForRid(rid, autoClose = true, cfn, onError) {
 const promiseSymbol = SymbolFor("__promise");
 const _isUnref = Symbol("isUnref");
 /**
- * Create a new ReadableStream object that is backed by a Resource that
- * implements `Resource::read_return`. This readable stream supports being
+ * Create a new ReadableStream object that is backed by a resource that
+ * implements reading operations. This readable stream supports being
  * refed and unrefed by calling `readableStreamForRidUnrefableRef` and
  * `readableStreamForRidUnrefableUnref` on it. Unrefable streams are not
- * FastStream compatible.
+ * compatible with fast-path resource-backed streams.
  *
  * @param {number} rid The resource ID to read from.
+ * @param constructor A class that extends ReadableStream.
  * @returns {ReadableStream<Uint8Array>}
  */
-function readableStreamForRidUnrefable(rid) {
-  const stream = new ReadableStream(_brand);
+function readableStreamForRidUnrefable(rid, constructor = ReadableStream) {
+  const stream = new constructor(_brand);
   stream[promiseSymbol] = undefined;
   stream[_isUnref] = false;
   stream[_resourceBackingUnrefable] = { rid, autoClose: true };
@@ -1155,7 +1163,7 @@ async function readableStreamCollectIntoUint8Array(stream) {
  * `Resource::write` / `Resource::write_all`. This object contains enough
  * metadata to allow callers to bypass the JavaScript WritableStream
  * implementation and write directly to the underlying resource if they so
- * choose (FastStream).
+ * choose.
  *
  * @param {number} rid The resource ID to write to.
  * @param {boolean=} autoClose If the resource should be auto-closed when the stream closes. Defaults to true.
@@ -6905,6 +6913,8 @@ webidl.converters["async iterable<any>"] = webidl.createAsyncIterableConverter(
 );
 
 internals.resourceForReadableStream = resourceForReadableStream;
+internals.readableStreamForRid = readableStreamForRid;
+internals.writableStreamForRid = writableStreamForRid;
 
 export default {
   // Non-Public

@@ -14,6 +14,7 @@ use hyper_util::client::legacy::connect::dns::Name;
 use tokio::task::JoinHandle;
 use tower::Service;
 
+#[allow(clippy::large_enum_variant)]
 #[derive(Clone, Debug)]
 pub enum Resolver {
   /// A resolver using blocking `getaddrinfo` calls in a threadpool.
@@ -54,7 +55,7 @@ impl Resolver {
   /// Create a [`AsyncResolver`] from system conf.
   pub fn hickory() -> Result<Self, hickory_resolver::ResolveError> {
     Ok(Self::Hickory(
-      hickory_resolver::Resolver::tokio_from_system_conf()?,
+      hickory_resolver::Resolver::builder_tokio()?.build(),
     ))
   }
 
@@ -85,7 +86,7 @@ impl Future for ResolveFut {
         if join_err.is_cancelled() {
           Err(io::Error::new(io::ErrorKind::Interrupted, join_err))
         } else {
-          Err(io::Error::new(io::ErrorKind::Other, join_err))
+          Err(io::Error::other(join_err))
         }
       }
     })

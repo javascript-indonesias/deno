@@ -122,11 +122,11 @@ fn ts_no_recheck_on_redirect() {
 
   // run once
   let output = check_command.run();
-  output.assert_matches_text("[WILDCARD]Check file://[WILDCARD]");
+  output.assert_matches_text("[WILDCARD]Check [WILDCARD]");
 
   // run again
   let output = check_command.run();
-  output.assert_matches_text("Hello\n");
+  output.assert_matches_text("Hello, World!\n");
 }
 
 #[test]

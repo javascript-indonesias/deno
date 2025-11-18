@@ -1,13 +1,26 @@
 // Copyright 2018-2025 the Deno authors. MIT license.
-import sqlite, { DatabaseSync } from "node:sqlite";
+import sqlite, { backup, DatabaseSync } from "node:sqlite";
 import { assert, assertEquals, assertThrows } from "@std/assert";
 
 const tempDir = Deno.makeTempDirSync();
 
+Deno.test("[node/sqlite] sqlite-type symbol", () => {
+  const db = new DatabaseSync(":memory:");
+  const sqliteTypeSymbol = Symbol.for("sqlite-type");
+
+  // @ts-ignore `sqliteTypeSymbol` is not available in `@types:node` for version 24.3
+  assertEquals(db[sqliteTypeSymbol], "node:sqlite");
+
+  db.close();
+});
+
 Deno.test("[node/sqlite] in-memory databases", () => {
   const db1 = new DatabaseSync(":memory:");
   const db2 = new DatabaseSync(":memory:");
-  db1.exec("CREATE TABLE data(key INTEGER PRIMARY KEY);");
+  assertEquals(
+    db1.exec("CREATE TABLE data(key INTEGER PRIMARY KEY);"),
+    undefined,
+  );
   db1.exec("INSERT INTO data (key) VALUES (1);");
 
   db2.exec("CREATE TABLE data(key INTEGER PRIMARY KEY);");
@@ -93,12 +106,12 @@ Deno.test("[node/sqlite] createSession and changesets", () => {
   session.close();
 
   // Use after close shoud throw.
-  assertThrows(() => session.changeset(), Error, "Session is already closed");
+  assertThrows(() => session.changeset(), Error, "session is not open");
   // Close after close should throw.
-  assertThrows(() => session.close(), Error, "Session is already closed");
+  assertThrows(() => session.close(), Error, "session is not open");
 
   db.close();
-  assertThrows(() => session.close(), Error, "Database is already closed");
+  assertThrows(() => session.close(), Error, "database is not open");
 });
 
 Deno.test("[node/sqlite] StatementSync integer too large", () => {
@@ -143,7 +156,9 @@ Deno.test({
       db.close();
     }
     {
-      const db = new DatabaseSync(`${tempDir}/test3.db`, { readOnly: true });
+      const db = new DatabaseSync(`${tempDir}/test3.db`, {
+        readOnly: true,
+      });
       assertThrows(
         () => {
           db.exec("CREATE TABLE test(key INTEGER PRIMARY KEY)");
@@ -213,7 +228,7 @@ Deno.test("[node/sqlite] query should handle mixed positional and named paramete
   const db = new DatabaseSync(":memory:");
   db.exec(`CREATE TABLE one(variable1 TEXT, variable2 INT, variable3 INT)`);
   db.exec(
-    `INSERT INTO one (variable1, variable2, variable3) VALUES ("test", 1 , 2);`,
+    `INSERT INTO one (variable1, variable2, variable3) VALUES ('test', 1 , 2);`,
   );
 
   const query = "SELECT * FROM one WHERE variable1=:var1 AND variable2=:var2 ";
@@ -238,6 +253,44 @@ Deno.test("[node/sqlite] query should handle mixed positional and named paramete
   assertThrows(() => {
     stmt.all({ var1: "test", var2: 1 });
   });
+
+  db.close();
+});
+
+Deno.test("[node/sqlite] StatementSync unknown named parameters should throw", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(
+    "CREATE TABLE foo (id INTEGER PRIMARY KEY, variable1 TEXT NOT NULL, variable2 INT NOT NULL)",
+  );
+
+  const stmt = db.prepare(
+    "INSERT INTO foo (variable1, variable2) VALUES (:variable1, :variable2) RETURNING id",
+  );
+
+  assertThrows(() =>
+    stmt.run(
+      { variable1: "bar", variable2: 1, variable3: "baz" },
+    )
+  );
+
+  db.close();
+});
+
+// https://github.com/denoland/deno/issues/31196
+Deno.test("[node/sqlite] StatementSync unknown named parameters can be ignored", () => {
+  const db = new DatabaseSync(":memory:");
+  db.exec(
+    "CREATE TABLE foo (id INTEGER PRIMARY KEY, variable1 TEXT NOT NULL, variable2 INT NOT NULL)",
+  );
+
+  const stmt = db.prepare(
+    "INSERT INTO foo (variable1, variable2) VALUES (:variable1, :variable2) RETURNING id",
+  );
+  stmt.setAllowUnknownNamedParameters(true);
+
+  const result = stmt.run({ variable1: "bar", variable2: 1, variable3: "baz" });
+
+  assertEquals(result, { lastInsertRowid: 1, changes: 1 });
 
   db.close();
 });
@@ -291,7 +344,9 @@ Deno.test("[node/sqlite] StatementSync reset guards don't lock db", () => {
   db.exec("CREATE TABLE foo(a integer, b text)");
   db.exec("CREATE TABLE bar(a integer, b text)");
 
-  const stmt = db.prepare("SELECT name FROM sqlite_master WHERE type='table' ");
+  const stmt = db.prepare(
+    "SELECT name FROM sqlite_master WHERE type='table' ",
+  );
 
   assertEquals(stmt.get(), { name: "foo", __proto__: null });
 
@@ -342,4 +397,44 @@ Deno.test("[node/sqlite] Database close locks", () => {
   statement.run();
   db.close();
   Deno.removeSync(`${tempDir}/test4.db`);
+});
+
+Deno.test("[node/sqlite] Database backup", async () => {
+  const db = new DatabaseSync(`${tempDir}/original.db`);
+
+  // Create a table and insert some test data
+  db.exec(`
+            CREATE TABLE users (
+                id INTEGER PRIMARY KEY,
+                name TEXT NOT NULL,
+                email TEXT UNIQUE
+            )
+        `);
+  const insertStmt = db.prepare(
+    "INSERT INTO users (name, email) VALUES (?, ?)",
+  );
+  insertStmt.run("John Doe", "john@example.com");
+  insertStmt.run("Jane Smith", "jane@example.com");
+  insertStmt.run("Bob Wilson", "bob@example.com");
+
+  // Create backup database
+  await backup(db, `${tempDir}/backup.db`);
+
+  // Verify backup contains same data
+  const backupDb = new DatabaseSync(`${tempDir}/backup.db`);
+  const backupSelectStmt = backupDb.prepare(
+    "SELECT * FROM users ORDER BY id",
+  );
+  const backupUsers = backupSelectStmt.all();
+  assertEquals(backupUsers.length, 3);
+  assertEquals(backupUsers[0].name, "John Doe");
+  assertEquals(backupUsers[0].email, "john@example.com");
+  assertEquals(backupUsers[1].name, "Jane Smith");
+  assertEquals(backupUsers[2].name, "Bob Wilson");
+
+  db.close();
+  backupDb.close();
+
+  Deno.removeSync(`${tempDir}/original.db`);
+  Deno.removeSync(`${tempDir}/backup.db`);
 });

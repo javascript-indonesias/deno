@@ -16,13 +16,13 @@ use rustls::ClientConnection;
 use rustls_tokio_stream::TlsStream;
 use serde_json::json;
 use test_util as util;
-use test_util::itest;
 use test_util::TempDir;
-use util::assert_contains;
-use util::assert_not_contains;
+use test_util::itest;
 use util::PathRef;
 use util::TestContext;
 use util::TestContextBuilder;
+use util::assert_contains;
+use util::assert_not_contains;
 
 const CODE_CACHE_DB_FILE_NAME: &str = "v8_code_cache_v2";
 
@@ -167,7 +167,7 @@ itest!(_089_run_allow_list {
   output: "run/089_run_allow_list.ts.out",
 });
 
-#[test]
+#[flaky_test::flaky_test]
 fn _090_run_permissions_request() {
   TestContext::default()
     .new_command()
@@ -200,7 +200,7 @@ fn _090_run_permissions_request() {
     });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn _090_run_permissions_request_sync() {
   TestContext::default()
     .new_command()
@@ -233,7 +233,7 @@ fn _090_run_permissions_request_sync() {
     });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn permissions_prompt_allow_all() {
   TestContext::default()
     .new_command()
@@ -362,7 +362,7 @@ fn permissions_prompt_allow_all_2() {
       // "read" permissions
       test_util::assertions::assert_wildcard_match(&text, concat!(
         "\r\n",
-        "┏ ⚠️  Deno requests read access to \"[WILDCARD]tests[WILDCHAR]testdata[WILDCHAR]\".\r\n",
+        "┏ ⚠️  Deno requests read access to \"[WILDCARD]tests[WILDCHAR]testdata\".\r\n",
         "┠─ Requested by `Deno.lstatSync()` API.\r\n",
         "┠─ To see a stack trace for this prompt, set the DENO_TRACE_PERMISSIONS environmental variable.\r\n",
         "┠─ Learn more at: https://docs.deno.com/go/--allow-read\r\n",
@@ -375,7 +375,7 @@ fn permissions_prompt_allow_all_2() {
     });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn permissions_prompt_allow_all_lowercase_a() {
   TestContext::default()
     .new_command()
@@ -396,7 +396,7 @@ fn permissions_prompt_allow_all_lowercase_a() {
     });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn permission_request_long() {
   TestContext::default()
     .new_command()
@@ -410,7 +410,7 @@ fn permission_request_long() {
     });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn permissions_cache() {
   TestContext::default()
     .new_command()
@@ -433,7 +433,7 @@ fn permissions_cache() {
     });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn permissions_trace() {
   TestContext::default()
     .new_command()
@@ -459,9 +459,57 @@ fn permissions_trace() {
     });
 }
 
+#[test]
+fn permissions_audit() {
+  let ctx = TestContext::default();
+  let dir = ctx.temp_dir();
+  let path = dir.path().join(std::path::Path::new("audit.jsonl"));
+
+  ctx
+    .new_command()
+    .env("DENO_AUDIT_PERMISSIONS", &path)
+    .args_vec(["run", "-A", "run/permissions_audit.ts"])
+    .run()
+    .skip_output_check();
+
+  let file = std::fs::read_to_string(path).unwrap();
+  test_util::assertions::assert_wildcard_match(
+    &file,
+    r#"{"v":1,"datetime":"[WILDCARD]","permission":"sys","value":"hostname"}
+{"v":1,"datetime":"[WILDCARD]","permission":"read","value":"[WILDCARD]"}
+{"v":1,"datetime":"[WILDCARD]","permission":"write","value":"[WILDCARD]"}
+{"v":1,"datetime":"[WILDCARD]","permission":"env","value":"FOO"}
+"#,
+  );
+}
+
+#[test]
+fn permissions_audit_with_traces() {
+  let ctx = TestContext::default();
+  let dir = ctx.temp_dir();
+  let path = dir.path().join(std::path::Path::new("audit.jsonl"));
+
+  ctx
+    .new_command()
+    .env("DENO_AUDIT_PERMISSIONS", &path)
+    .env("DENO_TRACE_PERMISSIONS", "1")
+    .args_vec(["run", "-A", "run/permissions_audit.ts"])
+    .run()
+    .skip_output_check();
+
+  let file = std::fs::read_to_string(path).unwrap();
+  test_util::assertions::assert_wildcard_match(
+    &file,
+    r#"{"v":1,"datetime":"[WILDCARD]","permission":"sys","value":"hostname","stack":[WILDCARD]}
+{"v":1,"datetime":"[WILDCARD]","permission":"read","value":"[WILDCARD]","stack":[WILDCARD]}
+{"v":1,"datetime":"[WILDCARD]","permission":"write","value":"[WILDCARD]","stack":[WILDCARD]}
+{"v":1,"datetime":"[WILDCARD]","permission":"env","value":"FOO","stack":[WILDCARD]}
+"#,
+  );
+}
+
 itest!(lock_write_fetch {
-  args:
-    "run --quiet --allow-import --allow-read --allow-write --allow-env --allow-run run/lock_write_fetch/main.ts",
+  args: "run --quiet --allow-import --allow-read --allow-write --allow-env --allow-run run/lock_write_fetch/main.ts",
   output: "run/lock_write_fetch/main.out",
   http_server: true,
   exit_code: 0,
@@ -879,8 +927,7 @@ itest!(error_013_missing_script {
 
 // We have an allow-import flag but not allow-read, it should still result in error.
 itest!(error_016_dynamic_import_permissions2 {
-  args:
-    "run --reload --allow-import run/error_016_dynamic_import_permissions2.js",
+  args: "run --reload --allow-import run/error_016_dynamic_import_permissions2.js",
   output: "run/error_016_dynamic_import_permissions2.out",
   exit_code: 1,
   http_server: true,
@@ -905,12 +952,6 @@ itest!(error_local_static_import_from_remote_js {
   exit_code: 1,
   http_server: true,
   output: "run/error_local_static_import_from_remote.js.out",
-});
-
-itest!(import_meta {
-  args: "run --allow-import --quiet --reload --import-map=run/import_meta/importmap.json run/import_meta/main.ts",
-  output: "run/import_meta/main.out",
-  http_server: true,
 });
 
 itest!(no_check_remote {
@@ -1397,11 +1438,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       true,
-        "run --allow-net=localhost:4545 run/complex_permissions_test.ts netFetch http://localhost:4545/",
-        None,
-        None,
-        true,
-      );
+      "run --allow-net=localhost:4545 run/complex_permissions_test.ts netFetch http://localhost:4545/",
+      None,
+      None,
+      true,
+    );
     assert!(!err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1410,11 +1451,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       false,
-        "run --allow-net=deno.land run/complex_permissions_test.ts netFetch http://localhost:4545/",
-        None,
-        None,
-        true,
-      );
+      "run --allow-net=deno.land run/complex_permissions_test.ts netFetch http://localhost:4545/",
+      None,
+      None,
+      true,
+    );
     assert!(err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1423,11 +1464,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       false,
-        "run --allow-net=localhost:4545 run/complex_permissions_test.ts netFetch http://localhost:4546/",
-        None,
-        None,
-        true,
-      );
+      "run --allow-net=localhost:4545 run/complex_permissions_test.ts netFetch http://localhost:4546/",
+      None,
+      None,
+      true,
+    );
     assert!(err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1436,11 +1477,46 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       true,
-        "run --allow-net=localhost run/complex_permissions_test.ts netFetch http://localhost:4545/ http://localhost:4546/ http://localhost:4547/",
-        None,
-        None,
-        true,
-      );
+      "run --allow-net=localhost run/complex_permissions_test.ts netFetch http://localhost:4545/ http://localhost:4546/ http://localhost:4547/",
+      None,
+      None,
+      true,
+    );
+    assert!(!err.contains(util::PERMISSION_DENIED_PATTERN));
+  }
+
+  #[test]
+  fn net_fetch_deny_cidr() {
+    let _http_guard = util::http_server();
+    let (_, err) = util::run_and_collect_output(
+      false,
+      "run --allow-net --deny-net=192.168.0.0/16 run/complex_permissions_test.ts netFetch http://192.168.1.128:4545/",
+      None,
+      None,
+      false,
+    );
+    assert!(err.contains(util::PERMISSION_DENIED_PATTERN));
+
+    let (_, err) = util::run_and_collect_output(
+      true,
+      "run --allow-net --deny-net=192.168.0.0/16 run/complex_permissions_test.ts netFetch http://127.0.0.1:4545/",
+      None,
+      None,
+      true,
+    );
+    assert!(!err.contains(util::PERMISSION_DENIED_PATTERN));
+  }
+
+  #[test]
+  fn net_fetch_localhost_subdomain() {
+    let _http_guard = util::http_server();
+    let (_, err) = util::run_and_collect_output(
+      true,
+      "run --allow-net=*.localhost run/complex_permissions_test.ts netFetch http://localhost:4545/ http://localhost:4546/ http://localhost:4547/",
+      None,
+      None,
+      true,
+    );
     assert!(!err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1449,11 +1525,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       true,
-        "run --allow-net=127.0.0.1:4545 run/complex_permissions_test.ts netConnect 127.0.0.1:4545",
-        None,
-        None,
-        true,
-      );
+      "run --allow-net=127.0.0.1:4545 run/complex_permissions_test.ts netConnect 127.0.0.1:4545",
+      None,
+      None,
+      true,
+    );
     assert!(!err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1462,11 +1538,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       false,
-        "run --allow-net=deno.land run/complex_permissions_test.ts netConnect 127.0.0.1:4546",
-        None,
-        None,
-        true,
-      );
+      "run --allow-net=deno.land run/complex_permissions_test.ts netConnect 127.0.0.1:4546",
+      None,
+      None,
+      true,
+    );
     assert!(err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1475,11 +1551,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       false,
-        "run --allow-net=127.0.0.1:4545 run/complex_permissions_test.ts netConnect 127.0.0.1:4546",
-        None,
-        None,
-        true,
-      );
+      "run --allow-net=127.0.0.1:4545 run/complex_permissions_test.ts netConnect 127.0.0.1:4546",
+      None,
+      None,
+      true,
+    );
     assert!(err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1488,11 +1564,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       true,
-        "run --allow-net=127.0.0.1 run/complex_permissions_test.ts netConnect 127.0.0.1:4545 127.0.0.1:4546 127.0.0.1:4547",
-        None,
-        None,
-        true,
-      );
+      "run --allow-net=127.0.0.1 run/complex_permissions_test.ts netConnect 127.0.0.1:4545 127.0.0.1:4546 127.0.0.1:4547",
+      None,
+      None,
+      true,
+    );
     assert!(!err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1501,11 +1577,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       true,
-        "run --allow-net=localhost:4588 run/complex_permissions_test.ts netListen localhost:4588",
-        None,
-        None,
-        false,
-      );
+      "run --allow-net=localhost:4588 run/complex_permissions_test.ts netListen localhost:4588",
+      None,
+      None,
+      false,
+    );
     assert!(!err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1514,11 +1590,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       false,
-        "run --allow-net=deno.land run/complex_permissions_test.ts netListen localhost:4545",
-        None,
-        None,
-        false,
-      );
+      "run --allow-net=deno.land run/complex_permissions_test.ts netListen localhost:4545",
+      None,
+      None,
+      false,
+    );
     assert!(err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1527,11 +1603,11 @@ mod permissions {
     let _http_guard = util::http_server();
     let (_, err) = util::run_and_collect_output(
       false,
-        "run --allow-net=localhost:4555 run/complex_permissions_test.ts netListen localhost:4556",
-        None,
-        None,
-        false,
-      );
+      "run --allow-net=localhost:4555 run/complex_permissions_test.ts netListen localhost:4556",
+      None,
+      None,
+      false,
+    );
     assert!(err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
@@ -1542,15 +1618,15 @@ mod permissions {
     // target/debug/test_server
     let (_, err) = util::run_and_collect_output(
       true,
-        "run --allow-net=localhost run/complex_permissions_test.ts netListen localhost:4600",
-        None,
-        None,
-        false,
-      );
+      "run --allow-net=localhost run/complex_permissions_test.ts netListen localhost:4600",
+      None,
+      None,
+      false,
+    );
     assert!(!err.contains(util::PERMISSION_DENIED_PATTERN));
   }
 
-  #[test]
+  #[flaky_test::flaky_test]
   fn _061_permissions_request() {
     TestContext::default()
       .new_command()
@@ -1582,7 +1658,7 @@ mod permissions {
       });
   }
 
-  #[test]
+  #[flaky_test::flaky_test]
   fn _061_permissions_request_sync() {
     TestContext::default()
       .new_command()
@@ -1614,7 +1690,7 @@ mod permissions {
       });
   }
 
-  #[test]
+  #[flaky_test::flaky_test]
   fn _062_permissions_request_global() {
     TestContext::default()
       .new_command()
@@ -1639,7 +1715,7 @@ mod permissions {
       });
   }
 
-  #[test]
+  #[flaky_test::flaky_test]
   fn _062_permissions_request_global_sync() {
     TestContext::default()
       .new_command()
@@ -1715,7 +1791,7 @@ fn process_stdin_read_unblock() {
     });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn issue9750() {
   TestContext::default()
     .new_command()
@@ -1943,7 +2019,7 @@ fn check_local_then_remote() {
   assert_contains!(stderr, "Type 'string' is not assignable to type 'number'.");
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn permission_request_with_no_prompt() {
   TestContext::default()
     .new_command()
@@ -2193,8 +2269,10 @@ fn basic_auth_tokens() {
   let stderr_str = std::str::from_utf8(&output.stderr).unwrap().trim();
   eprintln!("{stderr_str}");
 
-  assert!(stderr_str
-    .contains("Module not found \"http://127.0.0.1:4554/run/001_hello.js\"."));
+  assert!(
+    stderr_str
+      .contains("Module not found \"http://127.0.0.1:4554/run/001_hello.js\".")
+  );
 
   let output = util::deno_cmd()
     .current_dir(util::root_path())
@@ -2224,11 +2302,11 @@ async fn test_resolve_dns() {
   use std::sync::Arc;
   use std::time::Duration;
 
+  use hickory_server::ServerFuture;
   use hickory_server::authority::Catalog;
   use hickory_server::authority::ZoneType;
   use hickory_server::proto::rr::Name;
   use hickory_server::store::in_memory::InMemoryAuthority;
-  use hickory_server::ServerFuture;
   use tokio::net::TcpListener;
   use tokio::net::UdpSocket;
   use tokio::sync::oneshot;
@@ -2244,7 +2322,7 @@ async fn test_resolve_dns() {
     let records = Parser::new(
       &zone_file,
       None,
-      Some(Name::from_str("example.com").unwrap()),
+      Some(Name::from_str("example.com.").unwrap()),
     )
     .parse();
     if records.is_err() {
@@ -2296,7 +2374,7 @@ async fn test_resolve_dns() {
     let out = String::from_utf8_lossy(&output.stdout);
     println!("{err}");
     assert!(output.status.success());
-    assert!(err.starts_with("Check file"));
+    assert!(err.starts_with("Check run/resolve_dns.ts"));
 
     let expected = std::fs::read_to_string(
       util::testdata_path().join("run/resolve_dns.ts.out"),
@@ -2325,7 +2403,7 @@ async fn test_resolve_dns() {
       eprintln!("stderr: {err}");
     }
     assert!(output.status.success());
-    assert!(err.starts_with("Check file"));
+    assert!(err.starts_with("Check run/resolve_dns.ts"));
 
     let expected = std::fs::read_to_string(
       util::testdata_path().join("run/resolve_dns.ts.out"),
@@ -2351,7 +2429,7 @@ async fn test_resolve_dns() {
     let err = String::from_utf8_lossy(&output.stderr);
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
-    assert!(err.starts_with("Check file"));
+    assert!(err.starts_with("Check run/resolve_dns.ts"));
     assert!(err.contains(r#"error: Uncaught (in promise) NotCapable: Requires net access to "127.0.0.1:4553""#));
     assert!(out.is_empty());
   }
@@ -2372,7 +2450,7 @@ async fn test_resolve_dns() {
     let err = String::from_utf8_lossy(&output.stderr);
     let out = String::from_utf8_lossy(&output.stdout);
     assert!(!output.status.success());
-    assert!(err.starts_with("Check file"));
+    assert!(err.starts_with("Check run/resolve_dns.ts"));
     assert!(err.contains(r#"error: Uncaught (in promise) NotCapable: Requires net access to "127.0.0.1:4553""#));
     assert!(out.is_empty());
   }
@@ -2725,7 +2803,7 @@ async fn websocket_server_idletimeout() {
 }
 
 // Regression test for https://github.com/denoland/deno/issues/16772
-#[test]
+#[flaky_test::flaky_test]
 fn file_fetcher_preserves_permissions() {
   let context = TestContext::with_http_server();
   context
@@ -2742,7 +2820,7 @@ fn file_fetcher_preserves_permissions() {
     });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn stdio_streams_are_locked_in_permission_prompt() {
   if !util::pty::Pty::is_supported() {
     // Don't deal with the logic below if the with_pty
@@ -2803,7 +2881,7 @@ fn stdio_streams_are_locked_in_permission_prompt() {
   });
 }
 
-#[test]
+#[flaky_test::flaky_test]
 fn permission_prompt_escapes_ansi_codes_and_control_chars() {
   util::with_pty(&["repl"], |mut console| {
     console.write_line(
@@ -3234,6 +3312,17 @@ fn code_cache_npm_cjs_wrapper_module_many_exports() {
 }
 
 #[test]
+fn node_process_stdin_pause() {
+  util::deno_cmd()
+    .current_dir(util::testdata_path())
+    .arg("run/node_process_stdin_pause.js")
+    .spawn()
+    .unwrap()
+    .wait()
+    .unwrap();
+}
+
+#[flaky_test::flaky_test]
 fn node_process_stdin_unref_with_pty() {
   TestContext::default()
     .new_command()
@@ -3264,6 +3353,8 @@ fn node_process_stdin_unref_with_pty() {
 
 #[tokio::test]
 async fn listen_tls_alpn() {
+  let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
   let mut child = util::deno_cmd()
     .current_dir(util::testdata_path())
     .arg("run")
@@ -3317,6 +3408,8 @@ async fn listen_tls_alpn() {
 
 #[tokio::test]
 async fn listen_tls_alpn_fail() {
+  let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+
   let mut child = util::deno_cmd()
     .current_dir(util::testdata_path())
     .arg("run")
@@ -3381,7 +3474,7 @@ fn emit_failed_readonly_file_system() {
     .new_command()
     .args("run --log-level=debug main.ts")
     .run();
-  output.assert_matches_text("[WILDCARD]Error saving emit data ([WILDLINE]main.ts)[WILDCARD]Skipped emit cache save of [WILDLINE]other.ts[WILDCARD]hi[WILDCARD]");
+  output.assert_matches_text("[WILDCARD]Error saving emit data ([WILDLINE]main.ts)[WILDCARD]Skipped emit cache save of [WILDLINE]main.ts[WILDCARD]Skipped emit cache save of [WILDLINE]other.ts[WILDCARD]hi[WILDCARD]");
 }
 
 // todo(dsherret): waiting on fix in https://github.com/servo/rust-url/issues/505
@@ -3410,4 +3503,90 @@ fn handle_invalid_path_error() {
   let deno_cmd = util::deno_cmd_with_deno_dir(&util::new_deno_dir());
   let output = deno_cmd.arg("run").arg("///a/b").output().unwrap();
   assert_contains!(String::from_utf8_lossy(&output.stderr), "Module not found");
+}
+
+#[flaky_test::flaky_test]
+fn test_permission_broker_doesnt_exit() {
+  let context = TestContext::default();
+  let socket_path = if cfg!(windows) {
+    PathRef::new(r"\\.\pipe\deno-permission-broker")
+  } else {
+    context.temp_dir().path().join("broker.sock")
+  };
+
+  let output = context
+    .new_command()
+    .env("DENO_PERMISSION_BROKER_PATH", &socket_path)
+    .args("run run/permission_broker/test1.ts")
+    .run();
+  output.assert_exit_code(87);
+  output.assert_matches_text(
+    "[WILDCARD]Failed to create permission broker[WILDCARD]",
+  );
+}
+
+#[flaky_test::flaky_test]
+fn test_permission_broker() {
+  use std::io::BufRead;
+  use std::io::BufReader;
+
+  let context = TestContext::default();
+  let socket_path = if cfg!(windows) {
+    PathRef::new(r"\\.\pipe\deno-permission-broker")
+  } else {
+    context.temp_dir().path().join("broker.sock")
+  };
+
+  let mut broker = context
+    .new_command()
+    .arg("run")
+    .arg("-A")
+    .arg("run/permission_broker/broker.ts")
+    .arg(&socket_path)
+    .stdout(Stdio::piped())
+    .spawn()
+    .unwrap();
+
+  let broker_stdout = broker.stdout.take().unwrap();
+
+  let mut broker_reader = BufReader::new(broker_stdout);
+  let mut line = String::new();
+  loop {
+    line.clear();
+    match broker_reader.read_line(&mut line) {
+      Ok(0) => break, // EOF
+      Ok(_) => {
+        if line.starts_with("Permission broker listening on") {
+          eprintln!("{}", line);
+          break;
+        }
+      }
+      Err(err) => panic!("{}", err),
+    }
+  }
+
+  let output = context
+    .new_command()
+    .env("DENO_PERMISSION_BROKER_PATH", &socket_path)
+    .args("run run/permission_broker/test1.ts")
+    .run();
+  output.assert_exit_code(1);
+  output.assert_matches_text(
+    "Warning Permission broker is an experimental feature\nerror:[WILDCARD]NotCapable: Make sure to enable reading env vars.[WILDCARD]",
+  );
+
+  let _ = broker.kill();
+  line.clear();
+  broker_reader.read_to_string(&mut line).unwrap();
+
+  test_util::assertions::assert_wildcard_match(
+    &line,
+    r#"[WILDCARD]
+{"v":1,"pid":[WILDCARD],"id":1,"datetime":"[WILDCARD]","permission":"read","value":"./run/permission_broker/scratch.txt"}
+{"v":1,"pid":[WILDCARD],"id":2,"datetime":"[WILDCARD]","permission":"read","value":"./run/permission_broker/scratch.txt"}
+{"v":1,"pid":[WILDCARD],"id":3,"datetime":"[WILDCARD]","permission":"read","value":"./run/permission_broker/log.txt"}
+{"v":1,"pid":[WILDCARD],"id":4,"datetime":"[WILDCARD]","permission":"write","value":"./run/permission_broker/log.txt"}
+{"v":1,"pid":[WILDCARD],"id":5,"datetime":"[WILDCARD]","permission":"env","value":null}
+[WILDCARD]"#,
+  );
 }

@@ -2,27 +2,27 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+#[cfg(target_os = "linux")]
+use std::sync::LazyLock;
+use std::sync::atomic::AtomicBool;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 use std::time::Instant;
 
-use deno_broadcast_channel::InMemoryBroadcastChannel;
 use deno_cache::CacheImpl;
 use deno_cache::CreateCache;
 use deno_cache::SqliteBackedCache;
-use deno_core::error::CoreError;
-use deno_core::error::JsError;
-use deno_core::merge_op_metrics;
-use deno_core::v8;
 use deno_core::CompiledWasmModuleStore;
 use deno_core::Extension;
 use deno_core::InspectorSessionKind;
-use deno_core::InspectorSessionOptions;
 use deno_core::JsRuntime;
+use deno_core::JsRuntimeInspector;
 use deno_core::LocalInspectorSession;
 use deno_core::ModuleCodeString;
 use deno_core::ModuleId;
+use deno_core::ModuleLoadOptions;
+use deno_core::ModuleLoadReferrer;
 use deno_core::ModuleLoader;
 use deno_core::ModuleSpecifier;
 use deno_core::OpMetricsFactoryFn;
@@ -31,6 +31,10 @@ use deno_core::PollEventLoopOptions;
 use deno_core::RuntimeOptions;
 use deno_core::SharedArrayBufferStore;
 use deno_core::SourceCodeCacheInfo;
+use deno_core::error::CoreError;
+use deno_core::error::JsError;
+use deno_core::merge_op_metrics;
+use deno_core::v8;
 use deno_cron::local::LocalCronHandler;
 use deno_fs::FileSystem;
 use deno_io::Stdio;
@@ -44,56 +48,85 @@ use deno_process::NpmProcessStateProviderRc;
 use deno_tls::RootCertStoreProvider;
 use deno_tls::TlsKeys;
 use deno_web::BlobStore;
+use deno_web::InMemoryBroadcastChannel;
 use log::debug;
 use node_resolver::InNpmPackageChecker;
 use node_resolver::NpmPackageFolderResolver;
 
+use crate::BootstrapOptions;
+use crate::FeatureChecker;
 use crate::code_cache::CodeCache;
 use crate::code_cache::CodeCacheType;
 use crate::inspector_server::InspectorServer;
 use crate::ops;
 use crate::shared::runtime;
-use crate::BootstrapOptions;
-use crate::FeatureChecker;
 
 pub type FormatJsErrorFn = dyn Fn(&JsError) -> String + Sync + Send;
 
-pub fn import_meta_resolve_callback(
-  loader: &dyn ModuleLoader,
-  specifier: String,
-  referrer: String,
-) -> Result<ModuleSpecifier, deno_core::error::ModuleLoaderError> {
-  loader.resolve(
-    &specifier,
-    &referrer,
-    deno_core::ResolutionKind::DynamicImport,
-  )
-}
+#[cfg(target_os = "linux")]
+pub(crate) static MEMORY_TRIM_HANDLER_ENABLED: LazyLock<bool> =
+  LazyLock::new(|| std::env::var_os("DENO_USR2_MEMORY_TRIM").is_some());
+
+#[cfg(target_os = "linux")]
+pub(crate) static SIGUSR2_RX: LazyLock<tokio::sync::watch::Receiver<()>> =
+  LazyLock::new(|| {
+    let (tx, rx) = tokio::sync::watch::channel(());
+
+    tokio::spawn(async move {
+      let mut sigusr2 = deno_signals::signal_stream(libc::SIGUSR2).unwrap();
+
+      loop {
+        sigusr2.recv().await;
+
+        // SAFETY: calling into libc, nothing relevant on the Rust side.
+        unsafe {
+          libc::malloc_trim(0);
+        }
+
+        if tx.send(()).is_err() {
+          break;
+        }
+      }
+    });
+
+    rx
+  });
 
 // TODO(bartlomieju): temporary measurement until we start supporting more
 // module types
-pub fn validate_import_attributes_callback(
-  scope: &mut v8::HandleScope,
-  attributes: &HashMap<String, String>,
-) {
-  for (key, value) in attributes {
-    let msg = if key != "type" {
-      Some(format!("\"{key}\" attribute is not supported."))
-    } else if value != "json" && value != "$$deno-core-internal-wasm-module" {
-      Some(format!("\"{value}\" is not a valid module type."))
-    } else {
-      None
-    };
+pub fn create_validate_import_attributes_callback(
+  enable_raw_imports: Arc<AtomicBool>,
+) -> deno_core::ValidateImportAttributesCb {
+  Box::new(
+    move |scope: &mut v8::PinScope<'_, '_>,
+          attributes: &HashMap<String, String>| {
+      let valid_attribute = |kind: &str| {
+        enable_raw_imports.load(Ordering::Relaxed)
+          && matches!(kind, "bytes" | "text")
+          || matches!(kind, "json")
+      };
+      for (key, value) in attributes {
+        let msg = if key != "type" {
+          Some(format!("\"{key}\" attribute is not supported."))
+        } else if !valid_attribute(value.as_str())
+          && value != "$$deno-core-internal-wasm-module"
+        {
+          Some(format!("\"{value}\" is not a valid module type."))
+        } else {
+          None
+        };
 
-    let Some(msg) = msg else {
-      continue;
-    };
+        let Some(msg) = msg else {
+          continue;
+        };
 
-    let message = v8::String::new(scope, &msg).unwrap();
-    let exception = v8::Exception::type_error(scope, message);
-    scope.throw_exception(exception);
-    return;
-  }
+        let message = v8::String::new(scope, &msg).unwrap();
+        let exception = v8::Exception::type_error(scope, message);
+        scope.throw_exception(exception);
+        return;
+      }
+    },
+  )
 }
 
 pub fn make_wait_for_inspector_disconnect_callback() -> Box<dyn Fn()> {
@@ -102,7 +135,9 @@ pub fn make_wait_for_inspector_disconnect_callback() -> Box<dyn Fn()> {
     if !has_notified_of_inspector_disconnect
       .swap(true, std::sync::atomic::Ordering::SeqCst)
     {
-      log::info!("Program finished. Waiting for inspector to disconnect to exit the process...");
+      log::info!(
+        "Program finished. Waiting for inspector to disconnect to exit the process..."
+      );
     }
   })
 }
@@ -125,6 +160,15 @@ pub struct MainWorker {
   dispatch_unload_event_fn_global: v8::Global<v8::Function>,
   dispatch_process_beforeexit_event_fn_global: v8::Global<v8::Function>,
   dispatch_process_exit_event_fn_global: v8::Global<v8::Function>,
+  memory_trim_handle: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl Drop for MainWorker {
+  fn drop(&mut self) {
+    if let Some(memory_trim_handle) = self.memory_trim_handle.take() {
+      memory_trim_handle.abort();
+    }
+  }
 }
 
 pub struct WorkerServiceOptions<
@@ -172,6 +216,8 @@ pub struct WorkerServiceOptions<
 
   /// V8 code cache for module and script source code.
   pub v8_code_cache: Option<Arc<dyn CodeCache>>,
+
+  pub bundle_provider: Option<Arc<dyn deno_bundle_runtime::BundleProvider>>,
 }
 
 pub struct WorkerOptions {
@@ -209,11 +255,12 @@ pub struct WorkerOptions {
   // user code.
   pub should_wait_for_inspector_session: bool,
   /// If Some, print a low-level trace output for ops matching the given patterns.
-  pub strace_ops: Option<Vec<String>>,
+  pub trace_ops: Option<Vec<String>>,
 
   pub cache_storage_dir: Option<std::path::PathBuf>,
   pub origin_storage_dir: Option<std::path::PathBuf>,
   pub stdio: Stdio,
+  pub enable_raw_imports: bool,
   pub enable_stack_trace_arg_in_ops: bool,
 
   pub unconfigured_runtime: Option<UnconfiguredRuntime>,
@@ -230,7 +277,7 @@ impl Default for WorkerOptions {
       unsafely_ignore_certificate_errors: Default::default(),
       should_break_on_first_statement: Default::default(),
       should_wait_for_inspector_session: Default::default(),
-      strace_ops: Default::default(),
+      trace_ops: Default::default(),
       maybe_inspector_server: Default::default(),
       format_js_error_fn: Default::default(),
       origin_storage_dir: Default::default(),
@@ -240,6 +287,7 @@ impl Default for WorkerOptions {
       create_params: Default::default(),
       bootstrap: Default::default(),
       stdio: Default::default(),
+      enable_raw_imports: false,
       enable_stack_trace_arg_in_ops: false,
       unconfigured_runtime: None,
     }
@@ -248,7 +296,7 @@ impl Default for WorkerOptions {
 
 pub fn create_op_metrics(
   enable_op_summary_metrics: bool,
-  strace_ops: Option<Vec<String>>,
+  trace_ops: Option<Vec<String>>,
 ) -> (
   Option<Rc<OpMetricsSummaryTracker>>,
   Option<OpMetricsFactoryFn>,
@@ -257,7 +305,7 @@ pub fn create_op_metrics(
   let mut op_metrics_factory_fn: Option<OpMetricsFactoryFn> = None;
   let now = Instant::now();
   let max_len: Rc<std::cell::Cell<usize>> = Default::default();
-  if let Some(patterns) = strace_ops {
+  if let Some(patterns) = trace_ops {
     /// Match an op name against a list of patterns
     fn matches_pattern(patterns: &[String], name: &str) -> bool {
       let mut found_match = false;
@@ -382,7 +430,7 @@ impl MainWorker {
     // Get our op metrics
     let (op_summary_metrics, op_metrics_factory_fn) = create_op_metrics(
       options.bootstrap.enable_op_summary_metrics,
-      options.strace_ops,
+      options.trace_ops,
     );
 
     // Permissions: many ops depend on this
@@ -417,103 +465,99 @@ impl MainWorker {
 
       extensions.extend(std::mem::take(&mut options.extensions));
 
-      common_runtime(
-        services.module_loader.clone(),
-        options.startup_snapshot,
-        options.create_params,
-        options.skip_op_registration,
-        services.shared_array_buffer_store,
-        services.compiled_wasm_module_store,
+      common_runtime(CommonRuntimeOptions {
+        module_loader: services.module_loader.clone(),
+        startup_snapshot: options.startup_snapshot,
+        create_params: options.create_params,
+        skip_op_registration: options.skip_op_registration,
+        shared_array_buffer_store: services.shared_array_buffer_store,
+        compiled_wasm_module_store: services.compiled_wasm_module_store,
         extensions,
         op_metrics_factory_fn,
-        options.enable_stack_trace_arg_in_ops,
-      )
+        enable_stack_trace_arg_in_ops: options.enable_stack_trace_arg_in_ops,
+      })
     };
 
-    js_runtime.set_eval_context_code_cache_cbs(services.v8_code_cache.map(
-      |cache| {
-        let cache_clone = cache.clone();
-        (
-          Box::new(move |specifier: &ModuleSpecifier, code: &v8::String| {
-            let source_hash = {
-              use std::hash::Hash;
-              use std::hash::Hasher;
-              let mut hasher = twox_hash::XxHash64::default();
-              code.hash(&mut hasher);
-              hasher.finish()
-            };
-            let data = cache
-              .get_sync(specifier, CodeCacheType::Script, source_hash)
-              .inspect(|_| {
-                // This log line is also used by tests.
-                log::debug!(
-                  "V8 code cache hit for script: {specifier}, [{source_hash}]"
-                );
-              })
-              .map(Cow::Owned);
-            Ok(SourceCodeCacheInfo {
-              data,
-              hash: source_hash,
-            })
-          }) as Box<dyn Fn(&_, &_) -> _>,
-          Box::new(
-            move |specifier: ModuleSpecifier, source_hash: u64, data: &[u8]| {
+    js_runtime
+      .set_eval_context_code_cache_cbs(services.v8_code_cache.map(|cache| {
+      let cache_clone = cache.clone();
+      (
+        Box::new(move |specifier: &ModuleSpecifier, code: &v8::String| {
+          let source_hash = {
+            use std::hash::Hash;
+            use std::hash::Hasher;
+            let mut hasher = twox_hash::XxHash64::default();
+            code.hash(&mut hasher);
+            hasher.finish()
+          };
+          let data = cache
+            .get_sync(specifier, CodeCacheType::Script, source_hash)
+            .inspect(|_| {
               // This log line is also used by tests.
               log::debug!(
+                "V8 code cache hit for script: {specifier}, [{source_hash}]"
+              );
+            })
+            .map(Cow::Owned);
+          Ok(SourceCodeCacheInfo {
+            data,
+            hash: source_hash,
+          })
+        }) as Box<dyn Fn(&_, &_) -> _>,
+        Box::new(
+          move |specifier: ModuleSpecifier, source_hash: u64, data: &[u8]| {
+            // This log line is also used by tests.
+            log::debug!(
               "Updating V8 code cache for script: {specifier}, [{source_hash}]"
             );
-              cache_clone.set_sync(
-                specifier,
-                CodeCacheType::Script,
-                source_hash,
-                data,
-              );
-            },
-          ) as Box<dyn Fn(_, _, &_)>,
-        )
-      },
-    ));
+            cache_clone.set_sync(
+              specifier,
+              CodeCacheType::Script,
+              source_hash,
+              data,
+            );
+          },
+        ) as Box<dyn Fn(_, _, &_)>,
+      )
+    }));
+
+    js_runtime
+      .op_state()
+      .borrow_mut()
+      .borrow::<EnableRawImports>()
+      .0
+      .store(options.enable_raw_imports, Ordering::Relaxed);
 
     js_runtime
       .lazy_init_extensions(vec![
-        deno_web::deno_web::args::<PermissionsContainer>(
+        deno_web::deno_web::args::<InMemoryBroadcastChannel>(
           services.blob_store.clone(),
           options.bootstrap.location.clone(),
+          services.broadcast_channel.clone(),
         ),
-        deno_fetch::deno_fetch::args::<PermissionsContainer>(
-          deno_fetch::Options {
-            user_agent: options.bootstrap.user_agent.clone(),
-            root_cert_store_provider: services.root_cert_store_provider.clone(),
-            unsafely_ignore_certificate_errors: options
-              .unsafely_ignore_certificate_errors
-              .clone(),
-            file_fetch_handler: Rc::new(deno_fetch::FsFetchHandler),
-            resolver: services.fetch_dns_resolver,
-            ..Default::default()
-          },
-        ),
+        deno_fetch::deno_fetch::args(deno_fetch::Options {
+          user_agent: options.bootstrap.user_agent.clone(),
+          root_cert_store_provider: services.root_cert_store_provider.clone(),
+          unsafely_ignore_certificate_errors: options
+            .unsafely_ignore_certificate_errors
+            .clone(),
+          file_fetch_handler: Rc::new(deno_fetch::FsFetchHandler),
+          resolver: services.fetch_dns_resolver,
+          ..Default::default()
+        }),
         deno_cache::deno_cache::args(create_cache),
-        deno_websocket::deno_websocket::args::<PermissionsContainer>(
-          options.bootstrap.user_agent.clone(),
-          services.root_cert_store_provider.clone(),
-          options.unsafely_ignore_certificate_errors.clone(),
-        ),
+        deno_websocket::deno_websocket::args(),
         deno_webstorage::deno_webstorage::args(
           options.origin_storage_dir.clone(),
         ),
         deno_crypto::deno_crypto::args(options.seed),
-        deno_broadcast_channel::deno_broadcast_channel::args(
-          services.broadcast_channel.clone(),
-        ),
-        deno_ffi::deno_ffi::args::<PermissionsContainer>(
-          services.deno_rt_native_addon_loader.clone(),
-        ),
-        deno_net::deno_net::args::<PermissionsContainer>(
+        deno_ffi::deno_ffi::args(services.deno_rt_native_addon_loader.clone()),
+        deno_net::deno_net::args(
           services.root_cert_store_provider.clone(),
           options.unsafely_ignore_certificate_errors.clone(),
         ),
         deno_kv::deno_kv::args(
-          MultiBackendDbHandler::remote_or_sqlite::<PermissionsContainer>(
+          MultiBackendDbHandler::remote_or_sqlite(
             options.origin_storage_dir.clone(),
             options.seed,
             deno_kv::remote::HttpOptions {
@@ -530,7 +574,7 @@ impl MainWorker {
           ),
           deno_kv::KvConfig::builder().build(),
         ),
-        deno_napi::deno_napi::args::<PermissionsContainer>(
+        deno_napi::deno_napi::args(
           services.deno_rt_native_addon_loader.clone(),
         ),
         deno_http::deno_http::args(deno_http::Options {
@@ -538,11 +582,10 @@ impl MainWorker {
           ..Default::default()
         }),
         deno_io::deno_io::args(Some(options.stdio)),
-        deno_fs::deno_fs::args::<PermissionsContainer>(services.fs.clone()),
+        deno_fs::deno_fs::args(services.fs.clone()),
         deno_os::deno_os::args(Some(exit_code.clone())),
         deno_process::deno_process::args(services.npm_process_state_provider),
         deno_node::deno_node::args::<
-          PermissionsContainer,
           TInNpmPackageChecker,
           TNpmPackageFolderResolver,
           TExtNodeSys,
@@ -551,6 +594,9 @@ impl MainWorker {
         ops::worker_host::deno_worker_host::args(
           options.create_web_worker_cb.clone(),
           options.format_js_error_fn.clone(),
+        ),
+        deno_bundle_runtime::deno_bundle_runtime::args(
+          services.bundle_provider.clone(),
         ),
       ])
       .unwrap();
@@ -575,7 +621,7 @@ impl MainWorker {
     if let Some(server) = options.maybe_inspector_server.clone() {
       server.register_inspector(
         main_module.to_string(),
-        &mut js_runtime,
+        js_runtime.inspector(),
         options.should_break_on_first_statement
           || options.should_wait_for_inspector_session,
       );
@@ -590,7 +636,7 @@ impl MainWorker {
       dispatch_process_exit_event_fn_global,
     ) = {
       let context = js_runtime.main_context();
-      let scope = &mut js_runtime.handle_scope();
+      deno_core::scope!(scope, &mut js_runtime);
       let context_local = v8::Local::new(scope, context);
       let global_obj = context_local.global(scope);
       let bootstrap_str =
@@ -682,6 +728,7 @@ impl MainWorker {
       dispatch_unload_event_fn_global,
       dispatch_process_beforeexit_event_fn_global,
       dispatch_process_exit_event_fn_global,
+      memory_trim_handle: None,
     };
     (worker, options.bootstrap)
   }
@@ -697,8 +744,8 @@ impl MainWorker {
       }
     }
 
-    let scope = &mut self.js_runtime.handle_scope();
-    let scope = &mut v8::TryCatch::new(scope);
+    deno_core::scope!(scope, &mut self.js_runtime);
+    v8::tc_scope!(scope, scope);
     let args = options.as_v8(scope);
     let bootstrap_fn = self.bootstrap_fn_global.take().unwrap();
     let bootstrap_fn = v8::Local::new(scope, bootstrap_fn);
@@ -710,12 +757,55 @@ impl MainWorker {
     }
   }
 
+  #[cfg(not(target_os = "linux"))]
+  pub fn setup_memory_trim_handler(&mut self) {
+    // Noop
+  }
+
+  /// Sets up a handler that responds to SIGUSR2 signals by trimming unused
+  /// memory and notifying V8 of low memory conditions.
+  /// Note that this must be called within a tokio runtime.
+  /// Calling this method multiple times will be a no-op.
+  #[cfg(target_os = "linux")]
+  pub fn setup_memory_trim_handler(&mut self) {
+    if self.memory_trim_handle.is_some() {
+      return;
+    }
+
+    if !*MEMORY_TRIM_HANDLER_ENABLED {
+      return;
+    }
+
+    let mut sigusr2_rx = SIGUSR2_RX.clone();
+
+    let spawner = self
+      .js_runtime
+      .op_state()
+      .borrow()
+      .borrow::<deno_core::V8CrossThreadTaskSpawner>()
+      .clone();
+
+    let memory_trim_handle = tokio::spawn(async move {
+      loop {
+        if sigusr2_rx.changed().await.is_err() {
+          break;
+        }
+
+        spawner.spawn(move |isolate| {
+          isolate.low_memory_notification();
+        });
+      }
+    });
+
+    self.memory_trim_handle = Some(memory_trim_handle);
+  }
+
   /// See [JsRuntime::execute_script](deno_core::JsRuntime::execute_script)
   pub fn execute_script(
     &mut self,
     script_name: &'static str,
     source_code: ModuleCodeString,
-  ) -> Result<v8::Global<v8::Value>, CoreError> {
+  ) -> Result<v8::Global<v8::Value>, Box<JsError>> {
     self.js_runtime.execute_script(script_name, source_code)
   }
 
@@ -804,21 +894,25 @@ impl MainWorker {
       self
         .js_runtime
         .inspector()
-        .borrow_mut()
         .wait_for_session_and_break_on_next_statement();
     } else if self.should_wait_for_inspector_session {
-      self.js_runtime.inspector().borrow_mut().wait_for_session();
+      self.js_runtime.inspector().wait_for_session();
     }
   }
 
   /// Create new inspector session. This function panics if Worker
   /// was not configured to create inspector.
-  pub fn create_inspector_session(&mut self) -> LocalInspectorSession {
+  pub fn create_inspector_session(
+    &mut self,
+    cb: deno_core::InspectorSessionSend,
+  ) -> LocalInspectorSession {
     self.js_runtime.maybe_init_inspector();
-    self.js_runtime.inspector().borrow().create_local_session(
-      InspectorSessionOptions {
-        kind: InspectorSessionKind::Blocking,
-      },
+    let insp = self.js_runtime.inspector();
+
+    JsRuntimeInspector::create_local_session(
+      insp,
+      cb,
+      InspectorSessionKind::Blocking,
     )
   }
 
@@ -844,9 +938,9 @@ impl MainWorker {
   /// Dispatches "load" event to the JavaScript runtime.
   ///
   /// Does not poll event loop, and thus not await any of the "load" event handlers.
-  pub fn dispatch_load_event(&mut self) -> Result<(), JsError> {
-    let scope = &mut self.js_runtime.handle_scope();
-    let tc_scope = &mut v8::TryCatch::new(scope);
+  pub fn dispatch_load_event(&mut self) -> Result<(), Box<JsError>> {
+    deno_core::scope!(scope, &mut self.js_runtime);
+    v8::tc_scope!(tc_scope, scope);
     let dispatch_load_event_fn =
       v8::Local::new(tc_scope, &self.dispatch_load_event_fn_global);
     let undefined = v8::undefined(tc_scope);
@@ -861,9 +955,9 @@ impl MainWorker {
   /// Dispatches "unload" event to the JavaScript runtime.
   ///
   /// Does not poll event loop, and thus not await any of the "unload" event handlers.
-  pub fn dispatch_unload_event(&mut self) -> Result<(), JsError> {
-    let scope = &mut self.js_runtime.handle_scope();
-    let tc_scope = &mut v8::TryCatch::new(scope);
+  pub fn dispatch_unload_event(&mut self) -> Result<(), Box<JsError>> {
+    deno_core::scope!(scope, &mut self.js_runtime);
+    v8::tc_scope!(tc_scope, scope);
     let dispatch_unload_event_fn =
       v8::Local::new(tc_scope, &self.dispatch_unload_event_fn_global);
     let undefined = v8::undefined(tc_scope);
@@ -876,9 +970,9 @@ impl MainWorker {
   }
 
   /// Dispatches process.emit("exit") event for node compat.
-  pub fn dispatch_process_exit_event(&mut self) -> Result<(), JsError> {
-    let scope = &mut self.js_runtime.handle_scope();
-    let tc_scope = &mut v8::TryCatch::new(scope);
+  pub fn dispatch_process_exit_event(&mut self) -> Result<(), Box<JsError>> {
+    deno_core::scope!(scope, &mut self.js_runtime);
+    v8::tc_scope!(tc_scope, scope);
     let dispatch_process_exit_event_fn =
       v8::Local::new(tc_scope, &self.dispatch_process_exit_event_fn_global);
     let undefined = v8::undefined(tc_scope);
@@ -893,9 +987,9 @@ impl MainWorker {
   /// Dispatches "beforeunload" event to the JavaScript runtime. Returns a boolean
   /// indicating if the event was prevented and thus event loop should continue
   /// running.
-  pub fn dispatch_beforeunload_event(&mut self) -> Result<bool, JsError> {
-    let scope = &mut self.js_runtime.handle_scope();
-    let tc_scope = &mut v8::TryCatch::new(scope);
+  pub fn dispatch_beforeunload_event(&mut self) -> Result<bool, Box<JsError>> {
+    deno_core::scope!(scope, &mut self.js_runtime);
+    v8::tc_scope!(tc_scope, scope);
     let dispatch_beforeunload_event_fn =
       v8::Local::new(tc_scope, &self.dispatch_beforeunload_event_fn_global);
     let undefined = v8::undefined(tc_scope);
@@ -910,9 +1004,11 @@ impl MainWorker {
   }
 
   /// Dispatches process.emit("beforeExit") event for node compat.
-  pub fn dispatch_process_beforeexit_event(&mut self) -> Result<bool, JsError> {
-    let scope = &mut self.js_runtime.handle_scope();
-    let tc_scope = &mut v8::TryCatch::new(scope);
+  pub fn dispatch_process_beforeexit_event(
+    &mut self,
+  ) -> Result<bool, Box<JsError>> {
+    deno_core::scope!(scope, &mut self.js_runtime);
+    v8::tc_scope!(tc_scope, scope);
     let dispatch_process_beforeexit_event_fn = v8::Local::new(
       tc_scope,
       &self.dispatch_process_beforeexit_event_fn_global,
@@ -947,32 +1043,26 @@ fn common_extensions<
     deno_telemetry::deno_telemetry::init(),
     // Web APIs
     deno_webidl::deno_webidl::init(),
-    deno_console::deno_console::init(),
-    deno_url::deno_url::init(),
-    deno_web::deno_web::lazy_init::<PermissionsContainer>(),
+    deno_web::deno_web::lazy_init::<InMemoryBroadcastChannel>(),
     deno_webgpu::deno_webgpu::init(),
     deno_canvas::deno_canvas::init(),
-    deno_fetch::deno_fetch::lazy_init::<PermissionsContainer>(),
+    deno_fetch::deno_fetch::lazy_init(),
     deno_cache::deno_cache::lazy_init(),
-    deno_websocket::deno_websocket::lazy_init::<PermissionsContainer>(),
+    deno_websocket::deno_websocket::lazy_init(),
     deno_webstorage::deno_webstorage::lazy_init(),
     deno_crypto::deno_crypto::lazy_init(),
-    deno_broadcast_channel::deno_broadcast_channel::lazy_init::<
-      InMemoryBroadcastChannel,
-    >(),
-    deno_ffi::deno_ffi::lazy_init::<PermissionsContainer>(),
-    deno_net::deno_net::lazy_init::<PermissionsContainer>(),
+    deno_ffi::deno_ffi::lazy_init(),
+    deno_net::deno_net::lazy_init(),
     deno_tls::deno_tls::init(),
     deno_kv::deno_kv::lazy_init::<MultiBackendDbHandler>(),
     deno_cron::deno_cron::init(LocalCronHandler::new()),
-    deno_napi::deno_napi::lazy_init::<PermissionsContainer>(),
+    deno_napi::deno_napi::lazy_init(),
     deno_http::deno_http::lazy_init(),
     deno_io::deno_io::lazy_init(),
-    deno_fs::deno_fs::lazy_init::<PermissionsContainer>(),
+    deno_fs::deno_fs::lazy_init(),
     deno_os::deno_os::lazy_init(),
     deno_process::deno_process::lazy_init(),
     deno_node::deno_node::lazy_init::<
-      PermissionsContainer,
       TInNpmPackageChecker,
       TNpmPackageFolderResolver,
       TExtNodeSys,
@@ -984,6 +1074,7 @@ fn common_extensions<
     ops::permissions::deno_permissions::init(),
     ops::tty::deno_tty::init(),
     ops::http::deno_http_runtime::init(),
+    deno_bundle_runtime::deno_bundle_runtime::lazy_init(),
     ops::bootstrap::deno_bootstrap::init(
       has_snapshot.then(Default::default),
       unconfigured_runtime,
@@ -997,8 +1088,7 @@ fn common_extensions<
   ]
 }
 
-#[allow(clippy::too_many_arguments)]
-fn common_runtime(
+struct CommonRuntimeOptions {
   module_loader: Rc<dyn ModuleLoader>,
   startup_snapshot: Option<&'static [u8]>,
   create_params: Option<v8::CreateParams>,
@@ -1008,15 +1098,22 @@ fn common_runtime(
   extensions: Vec<Extension>,
   op_metrics_factory_fn: Option<OpMetricsFactoryFn>,
   enable_stack_trace_arg_in_ops: bool,
-) -> JsRuntime {
-  JsRuntime::new(RuntimeOptions {
-    module_loader: Some(module_loader),
-    startup_snapshot,
-    create_params,
-    skip_op_registration,
-    shared_array_buffer_store,
-    compiled_wasm_module_store,
-    extensions,
+}
+
+struct EnableRawImports(Arc<AtomicBool>);
+
+#[allow(clippy::too_many_arguments)]
+fn common_runtime(opts: CommonRuntimeOptions) -> JsRuntime {
+  let enable_raw_imports = Arc::new(AtomicBool::new(false));
+
+  let js_runtime = JsRuntime::new(RuntimeOptions {
+    module_loader: Some(opts.module_loader),
+    startup_snapshot: opts.startup_snapshot,
+    create_params: opts.create_params,
+    skip_op_registration: opts.skip_op_registration,
+    shared_array_buffer_store: opts.shared_array_buffer_store,
+    compiled_wasm_module_store: opts.compiled_wasm_module_store,
+    extensions: opts.extensions,
     #[cfg(feature = "transpile")]
     extension_transpiler: Some(Rc::new(|specifier, source| {
       crate::transpile::maybe_transpile_source(specifier, source)
@@ -1025,22 +1122,53 @@ fn common_runtime(
     extension_transpiler: None,
     inspector: true,
     is_main: true,
-    op_metrics_factory_fn,
+    op_metrics_factory_fn: opts.op_metrics_factory_fn,
     wait_for_inspector_disconnect_callback: Some(
       make_wait_for_inspector_disconnect_callback(),
     ),
-    import_meta_resolve_callback: Some(Box::new(import_meta_resolve_callback)),
-    validate_import_attributes_cb: Some(Box::new(
-      validate_import_attributes_callback,
-    )),
+    validate_import_attributes_cb: Some(
+      create_validate_import_attributes_callback(enable_raw_imports.clone()),
+    ),
     import_assertions_support: deno_core::ImportAssertionsSupport::Error,
-    maybe_op_stack_trace_callback: enable_stack_trace_arg_in_ops.then(|| {
-      Box::new(|stack| {
-        deno_permissions::prompter::set_current_stacktrace(stack)
-      }) as _
-    }),
-    ..Default::default()
-  })
+    maybe_op_stack_trace_callback: opts
+      .enable_stack_trace_arg_in_ops
+      .then(create_permissions_stack_trace_callback),
+    extension_code_cache: None,
+    v8_platform: None,
+    custom_module_evaluation_cb: None,
+    eval_context_code_cache_cbs: None,
+  });
+
+  js_runtime
+    .op_state()
+    .borrow_mut()
+    .put(EnableRawImports(enable_raw_imports));
+
+  js_runtime
+}
+
+pub fn create_permissions_stack_trace_callback()
+-> deno_core::OpStackTraceCallback {
+  Box::new(|stack: Vec<deno_core::error::JsStackFrame>| {
+    deno_permissions::prompter::set_current_stacktrace(Box::new(move || {
+      stack
+        .iter()
+        .map(|frame| {
+          deno_core::error::format_frame::<deno_core::error::NoAnsiColors>(
+            frame, None,
+          )
+        })
+        .collect()
+    }))
+  }) as _
+}
+
+pub struct UnconfiguredRuntimeOptions {
+  pub startup_snapshot: &'static [u8],
+  pub create_params: Option<v8::CreateParams>,
+  pub shared_array_buffer_store: Option<SharedArrayBufferStore>,
+  pub compiled_wasm_module_store: Option<CompiledWasmModuleStore>,
+  pub additional_extensions: Vec<Extension>,
 }
 
 pub struct UnconfiguredRuntime {
@@ -1054,11 +1182,7 @@ impl UnconfiguredRuntime {
     TNpmPackageFolderResolver: NpmPackageFolderResolver + 'static,
     TExtNodeSys: ExtNodeSys + 'static,
   >(
-    startup_snapshot: &'static [u8],
-    create_params: Option<v8::CreateParams>,
-    shared_array_buffer_store: Option<SharedArrayBufferStore>,
-    compiled_wasm_module_store: Option<CompiledWasmModuleStore>,
-    additional_extensions: Vec<Extension>,
+    options: UnconfiguredRuntimeOptions,
   ) -> Self {
     let mut extensions = common_extensions::<
       TInNpmPackageChecker,
@@ -1066,22 +1190,22 @@ impl UnconfiguredRuntime {
       TExtNodeSys,
     >(true, true);
 
-    extensions.extend(additional_extensions);
+    extensions.extend(options.additional_extensions);
 
     let module_loader =
       Rc::new(PlaceholderModuleLoader(std::cell::RefCell::new(None)));
 
-    let js_runtime = common_runtime(
-      module_loader.clone(),
-      Some(startup_snapshot),
-      create_params,
-      true,
-      shared_array_buffer_store,
-      compiled_wasm_module_store,
+    let js_runtime = common_runtime(CommonRuntimeOptions {
+      module_loader: module_loader.clone(),
+      startup_snapshot: Some(options.startup_snapshot),
+      create_params: options.create_params,
+      skip_op_registration: true,
+      shared_array_buffer_store: options.shared_array_buffer_store,
+      compiled_wasm_module_store: options.compiled_wasm_module_store,
       extensions,
-      None,
-      false,
-    );
+      op_metrics_factory_fn: None,
+      enable_stack_trace_arg_in_ops: false,
+    });
 
     UnconfiguredRuntime {
       module_loader,
@@ -1117,15 +1241,13 @@ impl ModuleLoader for PlaceholderModuleLoader {
   fn load(
     &self,
     module_specifier: &ModuleSpecifier,
-    maybe_referrer: Option<&ModuleSpecifier>,
-    is_dyn_import: bool,
-    requested_module_type: deno_core::RequestedModuleType,
+    maybe_referrer: Option<&ModuleLoadReferrer>,
+    options: ModuleLoadOptions,
   ) -> deno_core::ModuleLoadResponse {
     self.0.borrow_mut().clone().unwrap().load(
       module_specifier,
       maybe_referrer,
-      is_dyn_import,
-      requested_module_type,
+      options,
     )
   }
 
@@ -1133,18 +1255,18 @@ impl ModuleLoader for PlaceholderModuleLoader {
     &self,
     module_specifier: &ModuleSpecifier,
     maybe_referrer: Option<String>,
-    is_dyn_import: bool,
+    options: ModuleLoadOptions,
   ) -> std::pin::Pin<
     Box<
       dyn std::prelude::rust_2024::Future<
-        Output = Result<(), deno_core::error::ModuleLoaderError>,
-      >,
+          Output = Result<(), deno_core::error::ModuleLoaderError>,
+        >,
     >,
   > {
     self.0.borrow_mut().clone().unwrap().prepare_load(
       module_specifier,
       maybe_referrer,
-      is_dyn_import,
+      options,
     )
   }
 
@@ -1161,7 +1283,7 @@ impl ModuleLoader for PlaceholderModuleLoader {
       .purge_and_prevent_code_cache(module_specifier)
   }
 
-  fn get_source_map(&self, file_name: &str) -> Option<Cow<[u8]>> {
+  fn get_source_map(&self, file_name: &str) -> Option<Cow<'_, [u8]>> {
     let v = self.0.borrow_mut().clone().unwrap();
     let v = v.get_source_map(file_name);
     v.map(|c| Cow::from(c.into_owned()))
@@ -1182,7 +1304,7 @@ impl ModuleLoader for PlaceholderModuleLoader {
 
   fn get_host_defined_options<'s>(
     &self,
-    scope: &mut v8::HandleScope<'s>,
+    scope: &mut v8::PinScope<'s, '_>,
     name: &str,
   ) -> Option<v8::Local<'s, v8::Data>> {
     self

@@ -9,8 +9,8 @@ use std::net::SocketAddr;
 use std::result::Result;
 use std::time::Duration;
 
-use base64::prelude::BASE64_STANDARD;
 use base64::Engine;
+use base64::prelude::BASE64_STANDARD;
 use bytes::Bytes;
 use denokv_proto::datapath::AtomicWrite;
 use denokv_proto::datapath::AtomicWriteOutput;
@@ -28,10 +28,10 @@ use http::Method;
 use http::Request;
 use http::Response;
 use http::StatusCode;
-use http_body_util::combinators::UnsyncBoxBody;
 use http_body_util::BodyExt;
 use http_body_util::Empty;
 use http_body_util::Full;
+use http_body_util::combinators::UnsyncBoxBody;
 use hyper_utils::run_server_with_remote_addr;
 use pretty_assertions::assert_eq;
 use prost::Message;
@@ -45,16 +45,17 @@ mod nodejs_org_mirror;
 mod npm_registry;
 mod ws;
 
-use hyper_utils::run_server;
-use hyper_utils::run_server_with_acceptor;
 use hyper_utils::ServerKind;
 use hyper_utils::ServerOptions;
+use hyper_utils::run_server;
+use hyper_utils::run_server_with_acceptor;
 
-use super::https::get_tls_listener_stream;
 use super::https::SupportedHttpVersions;
-use super::std_path;
+use super::https::get_tls_listener_stream;
 use super::testdata_path;
+use crate::PathRef;
 use crate::TEST_SERVERS_COUNT;
+use crate::prebuilt_path;
 
 pub(crate) const PORT: u16 = 4545;
 const TEST_AUTH_TOKEN: &str = "abcdef123456789";
@@ -156,6 +157,13 @@ pub async fn run_all_servers() {
   let node_js_mirror_server_fut =
     nodejs_org_mirror::nodejs_org_mirror(NODEJS_ORG_MIRROR_SERVER_PORT);
 
+  if let Err(e) = ensure_tsgo_prebuilt().await {
+    #[allow(clippy::print_stderr)]
+    {
+      eprintln!("failed to ensure tsgo prebuilt: {e}");
+    }
+  }
+
   let mut futures = vec![
     redirect_server_fut.boxed_local(),
     ws_server_fut.boxed_local(),
@@ -226,13 +234,12 @@ async fn hyper_hello(port: u16) {
   .await;
 }
 
-fn redirect_resp(url: String) -> Response<UnsyncBoxBody<Bytes, Infallible>> {
+fn redirect_resp(url: &str) -> Response<UnsyncBoxBody<Bytes, Infallible>> {
   let mut redirect_resp = Response::new(UnsyncBoxBody::new(Empty::new()));
   *redirect_resp.status_mut() = StatusCode::MOVED_PERMANENTLY;
-  redirect_resp.headers_mut().insert(
-    http::header::LOCATION,
-    HeaderValue::from_str(&url[..]).unwrap(),
-  );
+  redirect_resp
+    .headers_mut()
+    .insert(http::header::LOCATION, HeaderValue::from_str(url).unwrap());
 
   redirect_resp
 }
@@ -244,7 +251,7 @@ async fn redirect(
   assert_eq!(&p[0..1], "/");
   let url = format!("http://localhost:{PORT}{p}");
 
-  Ok(redirect_resp(url))
+  Ok(redirect_resp(&url))
 }
 
 async fn double_redirects(
@@ -254,7 +261,7 @@ async fn double_redirects(
   assert_eq!(&p[0..1], "/");
   let url = format!("http://localhost:{REDIRECT_PORT}{p}");
 
-  Ok(redirect_resp(url))
+  Ok(redirect_resp(&url))
 }
 
 async fn inf_redirects(
@@ -264,7 +271,7 @@ async fn inf_redirects(
   assert_eq!(&p[0..1], "/");
   let url = format!("http://localhost:{INF_REDIRECTS_PORT}{p}");
 
-  Ok(redirect_resp(url))
+  Ok(redirect_resp(&url))
 }
 
 async fn another_redirect(
@@ -274,7 +281,7 @@ async fn another_redirect(
   assert_eq!(&p[0..1], "/");
   let url = format!("http://localhost:{PORT}/subdir{p}");
 
-  Ok(redirect_resp(url))
+  Ok(redirect_resp(&url))
 }
 
 async fn auth_redirect(
@@ -284,13 +291,12 @@ async fn auth_redirect(
     .headers()
     .get("authorization")
     .map(|v| v.to_str().unwrap())
+    && auth.to_lowercase() == format!("bearer {TEST_AUTH_TOKEN}")
   {
-    if auth.to_lowercase() == format!("bearer {TEST_AUTH_TOKEN}") {
-      let p = req.uri().path();
-      assert_eq!(&p[0..1], "/");
-      let url = format!("http://localhost:{PORT}{p}");
-      return Ok(redirect_resp(url));
-    }
+    let p = req.uri().path();
+    assert_eq!(&p[0..1], "/");
+    let url = format!("http://localhost:{PORT}{p}");
+    return Ok(redirect_resp(&url));
   }
 
   let mut resp = Response::new(UnsyncBoxBody::new(Empty::new()));
@@ -312,7 +318,7 @@ async fn basic_auth_redirect(
       let p = req.uri().path();
       assert_eq!(&p[0..1], "/");
       let url = format!("http://localhost:{PORT}{p}");
-      return Ok(redirect_resp(url));
+      return Ok(redirect_resp(&url));
     }
   }
 
@@ -421,22 +427,22 @@ async fn absolute_redirect(
       .collect();
 
     if let Some(url) = query_params.get("redirect_to") {
-      let redirect = redirect_resp(url.to_owned());
+      let redirect = redirect_resp(url);
       return Ok(redirect);
     }
   }
 
   if path.starts_with("/REDIRECT") {
     let url = &req.uri().path()[9..];
-    let redirect = redirect_resp(url.to_string());
+    let redirect = redirect_resp(url);
     return Ok(redirect);
   }
 
-  if path.starts_with("/a/b/c") {
-    if let Some(x_loc) = req.headers().get("x-location") {
-      let loc = x_loc.to_str().unwrap();
-      return Ok(redirect_resp(loc.to_string()));
-    }
+  if path.starts_with("/a/b/c")
+    && let Some(x_loc) = req.headers().get("x-location")
+  {
+    let loc = x_loc.to_str().unwrap();
+    return Ok(redirect_resp(loc));
   }
 
   let file_path = testdata_path().join(&req.uri().path()[1..]);
@@ -751,7 +757,9 @@ async fn main_server(
       Ok(res)
     }
     (_, "/referenceTypes.js") => {
-      let mut res = Response::new(string_body("/// <reference types=\"./xTypeScriptTypes.d.ts\" />\r\nexport const foo = \"foo\";\r\n"));
+      let mut res = Response::new(string_body(
+        "/// <reference types=\"./xTypeScriptTypes.d.ts\" />\r\nexport const foo = \"foo\";\r\n",
+      ));
       res.headers_mut().insert(
         "Content-type",
         HeaderValue::from_static("application/javascript"),
@@ -1158,13 +1166,7 @@ console.log("imported", import.meta.url);
         return Ok(file_resp);
       }
 
-      if let Some(suffix) = uri_path.strip_prefix("/deno_std/") {
-        let file_path = std_path().join(suffix);
-        if let Ok(file) = tokio::fs::read(&file_path).await {
-          let file_resp = custom_headers(uri_path, file);
-          return Ok(file_resp);
-        }
-      } else if let Some(suffix) = uri_path.strip_prefix("/sleep/") {
+      if let Some(suffix) = uri_path.strip_prefix("/sleep/") {
         let duration = suffix.parse::<u64>().unwrap();
         tokio::time::sleep(Duration::from_millis(duration)).await;
         return Response::builder()
@@ -1423,7 +1425,7 @@ pub fn custom_headers(
   if p.contains("/encoding/") {
     let charset = p
       .split_terminator('/')
-      .last()
+      .next_back()
       .unwrap()
       .trim_end_matches(".ts");
 
@@ -1481,4 +1483,74 @@ pub fn custom_headers(
   }
 
   response
+}
+
+#[allow(unused)]
+mod tsgo {
+  include!(concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../../../cli/tsc/go/tsgo_version.rs"
+  ));
+}
+
+const TSGO_PLATFORM: &str = tsgo_platform();
+const fn tsgo_platform() -> &'static str {
+  match (
+    std::env::consts::OS.as_bytes(),
+    std::env::consts::ARCH.as_bytes(),
+  ) {
+    (b"windows", b"x86_64") => "windows-x64",
+    (b"macos", b"x86_64") => "macos-x64",
+    (b"macos", b"aarch64") => "macos-arm64",
+    (b"linux", b"x86_64") => "linux-x64",
+    (b"linux", b"aarch64") => "linux-arm64",
+    _ => {
+      panic!("unsupported platform");
+    }
+  }
+}
+pub fn tsgo_prebuilt_path() -> PathRef {
+  if let Ok(path) = std::env::var("DENO_TSGO_PATH") {
+    return PathRef::new(path);
+  }
+  let folder = match std::env::consts::OS {
+    "linux" => "linux64",
+    "windows" => "win",
+    "macos" | "apple" => "mac",
+    _ => panic!("unsupported platform"),
+  };
+  prebuilt_path().join(folder).join(format!(
+    "tsgo-{}-{}",
+    tsgo::VERSION,
+    TSGO_PLATFORM
+  ))
+}
+
+pub async fn ensure_tsgo_prebuilt() -> Result<(), anyhow::Error> {
+  let tsgo_path = tsgo_prebuilt_path();
+  if tsgo_path.exists() {
+    return Ok(());
+  }
+
+  let archive_name =
+    format!("typescript-go-{}-{}.zip", tsgo::VERSION, TSGO_PLATFORM);
+
+  let url = format!("{}/{archive_name}", tsgo::DOWNLOAD_BASE_URL);
+
+  let response = reqwest::get(url).await?;
+  let bytes = response.bytes().await?;
+
+  let mut archive = zip::ZipArchive::new(std::io::Cursor::new(bytes))?;
+  if !tsgo_path.parent().exists() {
+    tsgo_path.parent().create_dir_all();
+  }
+  archive.extract(tsgo_path.parent().as_path())?;
+
+  if cfg!(windows) {
+    std::fs::rename(tsgo_path.parent().join("tsgo.exe"), tsgo_path)?;
+  } else {
+    std::fs::rename(tsgo_path.parent().join("tsgo"), tsgo_path)?;
+  }
+
+  Ok(())
 }
