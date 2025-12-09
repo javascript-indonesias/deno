@@ -1128,16 +1128,16 @@ impl Inner {
             | MediaType::Dmts
             | MediaType::Dcts
             | MediaType::Json
+            | MediaType::Jsonc
             | MediaType::Tsx => {}
             MediaType::Wasm
             | MediaType::SourceMap
             | MediaType::Css
             | MediaType::Html
+            | MediaType::Json5
             | MediaType::Sql
             | MediaType::Unknown => {
-              if path.extension().and_then(|s| s.to_str()) != Some("jsonc") {
-                continue;
-              }
+              continue;
             }
           }
           dir_files.insert(path);
@@ -2323,8 +2323,9 @@ impl Inner {
     );
 
     // Organize imports
-    if kinds.is_empty()
-      || kinds.contains(&CodeActionKind::SOURCE_ORGANIZE_IMPORTS)
+    if !self.config.client_provided_organize_imports_capable()
+      && (kinds.is_empty()
+        || kinds.contains(&CodeActionKind::SOURCE_ORGANIZE_IMPORTS))
     {
       let document_has_errors = params.context.diagnostics.iter().any(|d| {
         // Assume diagnostics without a severity are errors
